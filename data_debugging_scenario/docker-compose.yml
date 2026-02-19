@@ -1,0 +1,19 @@
+services:
+  dataset-generator:
+    build: .
+    container_name: data-debug-generator
+    env_file:
+      - .env
+    environment:
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      # Mount BIRD dataset (read-only)
+      - ./data:/app/data:ro
+      # Mount output directory (read-write)
+      - ./output:/app/output
+      # Mount sandbox directory (read-write, ephemeral)
+      - ./sandbox:/app/sandbox
+    # Override default args via command
+    # Example: docker compose run dataset-generator --samples 50 --model gpt-4o-mini
+    command: ["--samples", "${SAMPLE_COUNT:-100}", "--seed", "${RANDOM_SEED:-42}"]
