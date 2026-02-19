@@ -267,3 +267,87 @@ show Y instead of Z?")
 
 Respond with JSON only.\
 """
+
+
+# ── Step 3: Fix SQL Retry Prompt ───────────────────────────────────────────────
+
+FIX_RETRY_SYSTEM_PROMPT = """\
+You are a database expert. Your task is to write SQL statements that REVERSE \
+a previous database alteration, restoring the database to its original state.
+
+RULES:
+1. Only output valid SQLite-compatible SQL (INSERT or UPDATE statements).
+2. The fix must restore EXACTLY the original query result — no extra or missing rows.
+3. Be precise: use the correct table, column names, and values from the original data.
+4. If the alteration was a DELETE, use INSERT to restore the deleted row(s).
+5. If the alteration was an UPDATE, use UPDATE to restore the original column values.
+6. Multiple SQL statements should be separated by semicolons.
+
+OUTPUT FORMAT — respond with valid JSON only:
+{
+  "gold_fix": "<SQL statement(s) to reverse the alteration>",
+  "explanation": "<why this fix restores the original state>"
+}\
+"""
+
+
+def build_fix_retry_prompt(
+    *,
+    gold_sql: str,
+    db_ddl: str,
+    gold_result: list[dict[str, Any]],
+    altering_sql: str,
+    alteration_explanation: str,
+    previous_fix_sql: str,
+    fix_execution_error: str | None,
+    result_after_fix: list[dict[str, Any]],
+    result_mismatch_details: str,
+) -> str:
+    """Build a retry prompt when the previous fix SQL failed verification."""
+    error_section = ""
+    if fix_execution_error:
+        error_section = f"""\n## Execution Error\n{fix_execution_error}\n"""
+
+    return f"""\
+Your previous fix SQL did NOT correctly restore the database to its original state. \
+Please provide a corrected fix.
+
+## Database Schema (DDL)
+```sql
+{db_ddl}
+```
+
+## Gold SQL Query
+```sql
+{gold_sql}
+```
+
+## Original (Correct) Query Result ({len(gold_result)} rows)
+{_format_rows(gold_result)}
+
+## Alteration That Was Applied
+```sql
+{altering_sql}
+```
+Explanation: {alteration_explanation}
+
+## Your Previous Fix Attempt
+```sql
+{previous_fix_sql}
+```
+{error_section}
+## Result After Your Fix ({len(result_after_fix)} rows)
+{_format_rows(result_after_fix)}
+
+## Why It Failed
+{result_mismatch_details}
+
+Please provide a CORRECTED fix SQL that will restore the database so that the \
+gold SQL query returns EXACTLY the original result.
+
+Respond with JSON only:
+{{
+  "gold_fix": "<corrected fix SQL>",
+  "explanation": "<why this corrected fix works>"
+}}\
+"""

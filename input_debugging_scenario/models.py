@@ -76,6 +76,16 @@ class LLMFollowUpResponse(BaseModel):
     )
 
 
+class LLMFixResponse(BaseModel):
+    """Structured output from the LLM for Step 3 retry: corrected fix SQL."""
+    gold_fix: str = Field(
+        description="Corrected SQL statement(s) to reverse the alteration and restore the original database state"
+    )
+    explanation: str = Field(
+        description="Why this corrected fix SQL works"
+    )
+
+
 # ── Validation Models ─────────────────────────────────────────────────────────
 
 class ValidationResult(BaseModel):
