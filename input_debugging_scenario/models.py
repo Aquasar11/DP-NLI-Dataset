@@ -47,16 +47,18 @@ class AlterationDecision(BaseModel):
     target_record_indices: list[int] = Field(
         description="Indices into the gold_result list identifying which rows to target"
     )
-    target_columns: list[str] | None = Field(
-        default=None,
-        description="For MODIFY type: which columns to change. None means all columns.",
-    )
 
 
 class LLMAlterationResponse(BaseModel):
     """Structured output from the LLM for Step 1: generating the altering SQL."""
     altering_sql: str = Field(
         description="SQL statement(s) to alter the database (DELETE or UPDATE)"
+    )
+    target_columns: list[str] = Field(
+        description=(
+            "Which column(s) were modified. For DELETE: ['all']. "
+            "For MODIFY: the specific column name(s) that were changed."
+        )
     )
     explanation: str = Field(
         description="Explanation of why this alteration causes the target records to disappear from the query result"
@@ -118,6 +120,7 @@ class DatasetRecord(BaseModel):
     gold_result: list[dict[str, Any]]
     alteration_type: AlterationType
     targeted_records: list[dict[str, Any]]
+    target_columns: list[str]
     altering_sql: str
     altered_result: list[dict[str, Any]]
     alteration_explanation: str

@@ -211,28 +211,9 @@ class Pipeline:
         for i, rec in enumerate(targeted_records):
             logger.info("[%d]   target[%d]: %s", sample_idx, i, rec)
 
-        # For MODIFY: choose which result columns the LLM should alter
-        target_columns: list[str] | None = None
-        if alt_type == AlterationType.MODIFY and gold_result:
-            all_cols = list(gold_result[0].keys())
-            if len(all_cols) > 1:
-                num_cols = self.rng.randint(1, len(all_cols))
-                target_columns = sorted(self.rng.sample(all_cols, num_cols))
-                logger.info(
-                    "[%d] Decision — MODIFY columns: available=%s, chosen=%s",
-                    sample_idx, all_cols, target_columns,
-                )
-            else:
-                target_columns = all_cols
-                logger.info(
-                    "[%d] Decision — MODIFY columns: single column available → %s",
-                    sample_idx, target_columns,
-                )
-
         decision = AlterationDecision(
             alteration_type=alt_type,
             target_record_indices=target_indices,
-            target_columns=target_columns,
         )
         decision_log = AlterationDecisionLog(
             alteration_type=alt_type.value,
@@ -241,7 +222,6 @@ class Pipeline:
             num_targets_chosen=num_targets,
             target_record_indices=target_indices,
             targeted_records=targeted_records,
-            target_columns=target_columns,
             delete_probability_config=self.delete_prob,
             random_draw=round(rand_draw, 6),
         )
@@ -287,6 +267,7 @@ class Pipeline:
             step1_attempts=[],
             step1_final_altering_sql=None,
             step1_final_explanation=None,
+            step1_target_columns=None,
             step1_total_attempts=0,
             step1_passed=False,
             step2_llm_call=None,
@@ -385,7 +366,6 @@ class Pipeline:
                     gold_result=gold_result,
                     targeted_records=targeted_records,
                     alteration_type=decision.alteration_type,
-                    target_columns=decision.target_columns,
                 )
             else:
                 prompt = build_retry_prompt(
@@ -400,7 +380,6 @@ class Pipeline:
                     altered_result=prev_altered_result,
                     targeted_records=targeted_records,
                     alteration_type=decision.alteration_type,
-                    target_columns=decision.target_columns,
                 )
                 logger.info(
                     "[%d] Retry — previous validation error: %s",
@@ -454,10 +433,12 @@ class Pipeline:
 
             logger.info(
                 "[%d] LLM response (%.2fs)\n"
-                "  altering_sql : %s\n"
-                "  explanation  : %s",
+                "  altering_sql    : %s\n"
+                "  target_columns  : %s\n"
+                "  explanation     : %s",
                 sample_idx, llm_result.duration_seconds,
                 alteration_response.altering_sql,
+                alteration_response.target_columns,
                 alteration_response.explanation,
             )
 
@@ -588,6 +569,7 @@ class Pipeline:
         base["step1_passed"] = True
         base["step1_final_altering_sql"] = final_alteration_result.altering_sql
         base["step1_final_explanation"] = final_alteration_result.explanation
+        base["step1_target_columns"] = final_alteration_result.target_columns
         logger.info("[%d] Step 1 complete ✓  (%d attempt(s))", sample_idx, len(step1_attempts))
 
         # ── 8. Step 2: follow-up Q&A ───────────────────────────────────────
@@ -832,6 +814,7 @@ class Pipeline:
             gold_result=gold_result,
             alteration_type=decision.alteration_type,
             targeted_records=targeted_records,
+            target_columns=final_alteration_result.target_columns,
             altering_sql=final_alteration_result.altering_sql,
             altered_result=final_altered_result,
             alteration_explanation=final_alteration_result.explanation,

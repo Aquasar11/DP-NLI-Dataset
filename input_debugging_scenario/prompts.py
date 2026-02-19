@@ -29,7 +29,6 @@ def _format_rows(rows: list[dict[str, Any]], max_rows: int = 30) -> str:
 def _format_targeted(
     targeted_records: list[dict[str, Any]],
     alteration_type: AlterationType,
-    target_columns: list[str] | None = None,
 ) -> str:
     """Describe the targeted records and what should happen to them."""
     parts = []
@@ -41,24 +40,24 @@ def _format_targeted(
     if alteration_type == AlterationType.DELETE:
         action = (
             "DELETE the above record(s) entirely from the database so they no longer "
-            "appear in the query result."
+            "appear in the query result.\n"
+            'In the response, set "target_columns" to ["all"].'
         )
     else:
-        if target_columns:
-            cols = ", ".join(target_columns)
-            action = (
-                f"MODIFY the column(s) [{cols}] of the above record(s) so that they no "
-                f"longer satisfy the query conditions and disappear from the result. "
-                f"Set them to NULL, a default value, or a value that breaks the "
-                f"WHERE/JOIN/HAVING conditions."
-            )
-        else:
-            action = (
-                "MODIFY one or more columns of the above record(s) so that they no "
-                "longer satisfy the query conditions and disappear from the result. "
-                "Set them to NULL, a default value, or a value that breaks the "
-                "WHERE/JOIN/HAVING conditions."
-            )
+        action = (
+            "MODIFY one or more columns of the above record(s) so that they no "
+            "longer satisfy the query conditions and disappear from the result.\n"
+            "IMPORTANT: Carefully analyze the gold SQL query — look at the WHERE, "
+            "JOIN, HAVING, and other conditions. Choose column(s) that are used "
+            "in those conditions (not just the columns in the SELECT clause). "
+            "Changing a column that only appears in the SELECT will NOT remove "
+            "the record from the result. Instead, change a column that the query "
+            "filters on (e.g., a column in the WHERE clause, a JOIN key, or a "
+            "column used in a subquery condition).\n"
+            "Set the chosen column(s) to NULL, a default value, or a value that "
+            "breaks the query conditions.\n"
+            'In the response, list the column(s) you modified in "target_columns".'
+        )
     return target_desc, action
 
 
@@ -82,6 +81,7 @@ matches the WHERE, JOIN, or HAVING conditions of the gold query.
 OUTPUT FORMAT — respond with valid JSON only:
 {
   "altering_sql": "<SQL statement(s)>",
+  "target_columns": ["<column1>", "<column2>"],
   "explanation": "<why this alteration removes the targeted records from the result>"
 }\
 """
@@ -94,11 +94,10 @@ def build_alteration_prompt(
     gold_result: list[dict[str, Any]],
     targeted_records: list[dict[str, Any]],
     alteration_type: AlterationType,
-    target_columns: list[str] | None = None,
 ) -> str:
     """Build the user prompt for Step 1: generating the altering SQL."""
     target_desc, action = _format_targeted(
-        targeted_records, alteration_type, target_columns
+        targeted_records, alteration_type,
     )
 
     return f"""\
@@ -142,11 +141,10 @@ def build_retry_prompt(
     altered_result: list[dict[str, Any]],
     targeted_records: list[dict[str, Any]],
     alteration_type: AlterationType,
-    target_columns: list[str] | None = None,
 ) -> str:
     """Build a retry prompt when the previous alteration failed validation."""
     target_desc, action = _format_targeted(
-        targeted_records, alteration_type, target_columns
+        targeted_records, alteration_type,
     )
 
     return f"""\
@@ -189,6 +187,7 @@ which exact row(s) need to be altered, using primary keys or unique identifiers.
 Respond with JSON only:
 {{
   "altering_sql": "<corrected SQL>",
+  "target_columns": ["<column1>", "<column2>"],
   "explanation": "<why this corrected alteration works>"
 }}\
 """

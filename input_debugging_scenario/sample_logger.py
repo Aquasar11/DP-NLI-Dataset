@@ -66,7 +66,6 @@ class AlterationDecisionLog:
     num_targets_chosen: int
     target_record_indices: list[int]
     targeted_records: list[dict[str, Any]]
-    target_columns: list[str] | None
     delete_probability_config: float
     random_draw: float
 
@@ -113,6 +112,7 @@ class SampleLog:
     step1_attempts: list[AttemptLog]
     step1_final_altering_sql: str | None
     step1_final_explanation: str | None
+    step1_target_columns: list[str] | None  # reported by LLM
     step1_total_attempts: int
     step1_passed: bool
 
