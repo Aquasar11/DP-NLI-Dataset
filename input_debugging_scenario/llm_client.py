@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Generic, TypeVar
 
 from openai import OpenAI, APIError, RateLimitError, APITimeoutError
 
@@ -20,6 +21,22 @@ from prompts import (
     ALTERATION_SYSTEM_PROMPT,
     FOLLOWUP_SYSTEM_PROMPT,
 )
+
+T = TypeVar("T")
+
+
+@dataclass
+class LLMCallResult(Generic[T]):
+    """Wraps an LLM response together with the full raw I/O for logging."""
+
+    parsed: T | None
+    system_prompt: str
+    user_prompt: str
+    raw_response: str | None
+    parsed_dict: dict[str, Any] | None
+    duration_seconds: float
+    success: bool
+    error: str | None = None
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +83,7 @@ class LLMClient:
 
         Returns the raw content string from the LLM response.
         """
+        _t0 = time.perf_counter()
         for attempt in range(1, API_MAX_RETRIES + 1):
             try:
                 response = self.client.chat.completions.create(
@@ -80,7 +98,7 @@ class LLMClient:
                 content = response.choices[0].message.content
                 if content is None:
                     raise ValueError("LLM returned empty content")
-                return content.strip()
+                return content.strip(), time.perf_counter() - _t0
 
             except (RateLimitError, APITimeoutError) as e:
                 delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
@@ -100,7 +118,7 @@ class LLMClient:
                 else:
                     raise
 
-        raise RuntimeError(f"API call failed after {API_MAX_RETRIES} attempts")
+        raise RuntimeError(f"API call failed after {API_MAX_RETRIES} attempts")  # pragma: no cover
 
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
@@ -114,30 +132,66 @@ class LLMClient:
             text = "\n".join(lines)
         return json.loads(text)
 
-    def generate_alteration(self, user_prompt: str) -> LLMAlterationResponse:
+    def generate_alteration(self, user_prompt: str) -> LLMCallResult[LLMAlterationResponse]:
         """
         Step 1: Generate altering SQL and explanation.
 
-        Args:
-            user_prompt: The fully-constructed alteration prompt.
-
-        Returns:
-            Parsed LLMAlterationResponse with altering_sql and explanation.
+        Returns an LLMCallResult wrapping the parsed model **and** full I/O.
+        On any error ``result.success`` is False and ``result.error`` is set.
         """
-        raw = self._call_api(ALTERATION_SYSTEM_PROMPT, user_prompt)
-        data = self._parse_json(raw)
-        return LLMAlterationResponse(**data)
+        try:
+            raw, duration = self._call_api(ALTERATION_SYSTEM_PROMPT, user_prompt)
+            data = self._parse_json(raw)
+            parsed = LLMAlterationResponse(**data)
+            return LLMCallResult(
+                parsed=parsed,
+                system_prompt=ALTERATION_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                raw_response=raw,
+                parsed_dict=data,
+                duration_seconds=round(duration, 3),
+                success=True,
+            )
+        except Exception as e:
+            return LLMCallResult(
+                parsed=None,
+                system_prompt=ALTERATION_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                raw_response=None,
+                parsed_dict=None,
+                duration_seconds=0.0,
+                success=False,
+                error=str(e),
+            )
 
-    def generate_followup(self, user_prompt: str) -> LLMFollowUpResponse:
+    def generate_followup(self, user_prompt: str) -> LLMCallResult[LLMFollowUpResponse]:
         """
         Step 2: Generate follow-up question, explanation, and fix.
 
-        Args:
-            user_prompt: The fully-constructed follow-up prompt.
-
-        Returns:
-            Parsed LLMFollowUpResponse.
+        Returns an LLMCallResult wrapping the parsed model **and** full I/O.
+        On any error ``result.success`` is False and ``result.error`` is set.
         """
-        raw = self._call_api(FOLLOWUP_SYSTEM_PROMPT, user_prompt)
-        data = self._parse_json(raw)
-        return LLMFollowUpResponse(**data)
+        try:
+            raw, duration = self._call_api(FOLLOWUP_SYSTEM_PROMPT, user_prompt)
+            data = self._parse_json(raw)
+            parsed = LLMFollowUpResponse(**data)
+            return LLMCallResult(
+                parsed=parsed,
+                system_prompt=FOLLOWUP_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                raw_response=raw,
+                parsed_dict=data,
+                duration_seconds=round(duration, 3),
+                success=True,
+            )
+        except Exception as e:
+            return LLMCallResult(
+                parsed=None,
+                system_prompt=FOLLOWUP_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                raw_response=None,
+                parsed_dict=None,
+                duration_seconds=0.0,
+                success=False,
+                error=str(e),
+            )
