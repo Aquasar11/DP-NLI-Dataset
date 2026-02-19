@@ -1,2 +1,5 @@
 query_debugging_scenario/data
 data_debugging_scenario/data
+query_debugging_scenario/src/llms/gcp_credentials/credential.json
+query_debugging_scenario/debugging_dataset_wrong_queries.json
+*.pyc
