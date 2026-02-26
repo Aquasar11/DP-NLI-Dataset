@@ -128,6 +128,82 @@ Respond with JSON only.\
 """
 
 
+# ── Step 1: Aggregate Alteration Prompt ───────────────────────────────────────
+
+AGGREGATE_ALTERATION_SYSTEM_PROMPT = """\
+You are a database expert. Your task is to write SQL statements that alter \
+underlying table data so that an aggregate SQL query returns a DIFFERENT value \
+than it currently does.
+
+RULES:
+1. Only output valid SQLite-compatible SQL (DELETE or UPDATE statements).
+2. Your alteration must change the output of the aggregate query — the new \
+aggregate result must differ from the original one.
+3. Aim to modify or delete approximately the requested number of underlying rows.
+4. Be precise: use primary keys or unique identifiers when possible.
+5. If the query involves JOINs, identify which table's rows need to change.
+6. Multiple SQL statements should be separated by semicolons.
+
+OUTPUT FORMAT — respond with valid JSON only:
+{
+  "altering_sql": "<SQL statement(s)>",
+  "target_columns": ["<column1>", "<column2>"],
+  "explanation": "<why this alteration changes the aggregate result>"
+}\
+"""
+
+
+def build_aggregate_alteration_prompt(
+    *,
+    gold_sql: str,
+    db_ddl: str,
+    gold_result: list[dict[str, Any]],
+    alteration_type: AlterationType,
+    num_targets: int,
+) -> str:
+    """Build the user prompt for Step 1 when the gold query is an aggregate."""
+    if alteration_type == AlterationType.DELETE:
+        action = (
+            f"DELETE approximately {num_targets} underlying row(s) from the relevant "
+            f"table(s) so that the aggregate result changes.\n"
+            'In the response, set "target_columns" to ["all"].'
+        )
+    else:
+        action = (
+            f"MODIFY approximately {num_targets} underlying row(s) — change column "
+            "value(s) so that those rows are excluded from, or change the value of, "
+            "the aggregate computation.\n"
+            "IMPORTANT: Analyze the gold SQL carefully — look at WHERE clauses, JOIN "
+            "conditions, and which columns feed into the aggregate function. Modify "
+            "columns that affect whether a row is counted/summed/averaged.\n"
+            'In the response, list the modified column(s) in "target_columns".'
+        )
+
+    return f"""\
+## Database Schema (DDL)
+```sql
+{db_ddl}
+```
+
+## Gold SQL Query (Aggregate)
+```sql
+{gold_sql}
+```
+
+## Current Aggregate Result
+{_format_rows(gold_result)}
+
+## Required Action
+{action}
+
+Write the SQL statement(s) that will alter the database so that when the gold \
+SQL query is re-executed, it returns a DIFFERENT aggregate value than the one \
+shown above.
+
+Respond with JSON only.\
+"""
+
+
 # ── Step 1 Retry Prompt ───────────────────────────────────────────────────────
 
 def build_retry_prompt(
@@ -189,6 +265,78 @@ Respond with JSON only:
   "altering_sql": "<corrected SQL>",
   "target_columns": ["<column1>", "<column2>"],
   "explanation": "<why this corrected alteration works>"
+}}\
+"""
+
+
+def build_aggregate_retry_prompt(
+    *,
+    previous_altering_sql: str,
+    previous_explanation: str,
+    error_message: str,
+    gold_sql: str,
+    db_ddl: str,
+    gold_result: list[dict[str, Any]],
+    altered_result: list[dict[str, Any]],
+    alteration_type: AlterationType,
+    num_targets: int,
+) -> str:
+    """Build a retry prompt when a previous aggregate alteration failed validation."""
+    if alteration_type == AlterationType.DELETE:
+        action = (
+            f"DELETE approximately {num_targets} underlying row(s) from the relevant "
+            f"table(s) so that the aggregate result changes.\n"
+            'In the response, set "target_columns" to ["all"].'
+        )
+    else:
+        action = (
+            f"MODIFY approximately {num_targets} underlying row(s) — change column "
+            "value(s) so that those rows are excluded from, or change the value of, "
+            "the aggregate computation.\n"
+            "IMPORTANT: Analyze the gold SQL carefully — look at WHERE clauses, JOIN "
+            "conditions, and which columns feed into the aggregate function.\n"
+            'In the response, list the modified column(s) in "target_columns".'
+        )
+
+    return f"""\
+Your previous alteration SQL did NOT change the aggregate result. Please fix it.
+
+## Database Schema (DDL)
+```sql
+{db_ddl}
+```
+
+## Gold SQL Query (Aggregate)
+```sql
+{gold_sql}
+```
+
+## Original Aggregate Result
+{_format_rows(gold_result)}
+
+## Required Action
+{action}
+
+## Your Previous Attempt
+```sql
+{previous_altering_sql}
+```
+Previous explanation: {previous_explanation}
+
+## Validation Error
+{error_message}
+
+## Result After Your Previous Alteration
+{_format_rows(altered_result)}
+
+Please provide a CORRECTED altering SQL that causes the aggregate query to \
+return a DIFFERENT value than the original.
+
+Respond with JSON only:
+{{
+  "altering_sql": "<corrected SQL>",
+  "target_columns": ["<column1>", "<column2>"],
+  "explanation": "<why this corrected alteration changes the aggregate result>"
 }}\
 """
 

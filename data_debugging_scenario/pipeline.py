@@ -36,6 +36,8 @@ from models import (
     ValidationResult,
 )
 from prompts import (
+    build_aggregate_alteration_prompt,
+    build_aggregate_retry_prompt,
     build_alteration_prompt,
     build_fix_retry_prompt,
     build_followup_prompt,
@@ -55,6 +57,7 @@ from sample_logger import (
 from validator import (
     is_aggregate_query,
     validate_alteration,
+    validate_alteration_aggregate,
 )
 
 logger = logging.getLogger(__name__)
@@ -110,7 +113,7 @@ class PipelineStats:
         self.success = 0
         self.skipped_empty = 0
         self.skipped_error = 0
-        self.skipped_aggregate = 0
+        self.processed_aggregate = 0
         self.failed_validation = 0
         self.failed_fix_validation = 0
         self.failed_llm = 0
@@ -122,7 +125,7 @@ class PipelineStats:
             "success": self.success,
             "skipped_empty_result": self.skipped_empty,
             "skipped_query_error": self.skipped_error,
-            "skipped_aggregate": self.skipped_aggregate,
+            "processed_aggregate": self.processed_aggregate,
             "failed_validation_after_retries": self.failed_validation,
             "failed_fix_validation_after_retries": self.failed_fix_validation,
             "failed_llm_error": self.failed_llm,
@@ -179,9 +182,16 @@ class Pipeline:
         self,
         gold_result: list[dict[str, Any]],
         sample_idx: int,
+        is_aggregate: bool = False,
     ) -> tuple[AlterationDecision, AlterationDecisionLog]:
         """
         Randomly decide the alteration strategy and log every factor.
+
+        For non-aggregate queries a random number of result rows (1 .. max_targets)
+        are chosen as targets.  For aggregate queries ``num_targets`` is the
+        number of *underlying* table rows the LLM should modify/delete to shift
+        the aggregate value; ``targeted_records`` is set to the single aggregate
+        result row (i.e. the value that will change).
 
         Returns both the AlterationDecision and a detailed AlterationDecisionLog.
         """
@@ -197,17 +207,30 @@ class Pipeline:
             sample_idx, rand_draw, self.delete_prob, alt_type.value.upper(),
         )
 
-        # Choose target record count and indices
         num_result_rows = len(gold_result)
-        num_targets = min(self.max_targets, num_result_rows)
-        target_indices = sorted(self.rng.sample(range(num_result_rows), num_targets))
-        targeted_records = [gold_result[i] for i in target_indices]
 
-        logger.info(
-            "[%d] Decision — targets: result_rows=%d, max_targets_config=%d, "
-            "num_chosen=%d, indices=%s",
-            sample_idx, num_result_rows, self.max_targets, num_targets, target_indices,
-        )
+        if is_aggregate:
+            # For aggregate queries num_targets = number of underlying rows to alter;
+            # the single aggregate result row is always the "targeted" record.
+            num_targets = self.rng.randint(1, self.max_targets)
+            target_indices: list[int] = []
+            targeted_records = [gold_result[0]]
+            logger.info(
+                "[%d] Decision (aggregate) — max_targets_config=%d, "
+                "num_underlying_rows_to_alter=%d",
+                sample_idx, self.max_targets, num_targets,
+            )
+        else:
+            max_t = min(self.max_targets, num_result_rows)
+            num_targets = self.rng.randint(1, max_t)
+            target_indices = sorted(self.rng.sample(range(num_result_rows), num_targets))
+            targeted_records = [gold_result[i] for i in target_indices]
+            logger.info(
+                "[%d] Decision — targets: result_rows=%d, max_targets_config=%d, "
+                "num_chosen=%d, indices=%s",
+                sample_idx, num_result_rows, self.max_targets, num_targets, target_indices,
+            )
+
         for i, rec in enumerate(targeted_records):
             logger.info("[%d]   target[%d]: %s", sample_idx, i, rec)
 
@@ -323,15 +346,19 @@ class Pipeline:
             _emit("skipped_empty", "Gold SQL returned 0 rows")
             return None
 
-        # ── 4. Skip scalar aggregates ─────────────────────────────────────
-        if is_aggregate_query(sample.SQL) and len(gold_result) == 1:
-            logger.info("[%d] SKIP — scalar aggregate query (no targetable rows)", sample_idx)
-            self.stats.skipped_aggregate += 1
-            _emit("skipped_aggregate", "Scalar aggregate — no individual row to target")
-            return None
+        # ── 4. Detect aggregate queries ────────────────────────────────────
+        is_aggregate = is_aggregate_query(sample.SQL) and len(gold_result) == 1
+        if is_aggregate:
+            logger.info(
+                "[%d] Aggregate query detected — will alter underlying rows to change result",
+                sample_idx,
+            )
+            self.stats.processed_aggregate += 1
 
         # ── 5. Alteration decision ─────────────────────────────────────────
-        decision, decision_log = self.make_alteration_decision(gold_result, sample_idx)
+        decision, decision_log = self.make_alteration_decision(
+            gold_result, sample_idx, is_aggregate=is_aggregate
+        )
         targeted_records = [gold_result[i] for i in decision.target_record_indices]
         base["alteration_decision"] = decision_log
 
@@ -351,6 +378,8 @@ class Pipeline:
         prev_altering_sql = ""
         prev_explanation = ""
         prev_altered_result: list[dict[str, Any]] = []
+        # For aggregate retry prompts we need to know how many underlying rows to target
+        num_targets = decision_log.num_targets_chosen
 
         for attempt in range(1, self.max_retries + 1):
             logger.info(
@@ -360,27 +389,51 @@ class Pipeline:
 
             # Build prompt
             if attempt == 1:
-                prompt = build_alteration_prompt(
-                    gold_sql=sample.SQL,
-                    db_ddl=db_ddl,
-                    gold_result=gold_result,
-                    targeted_records=targeted_records,
-                    alteration_type=decision.alteration_type,
-                )
+                if is_aggregate:
+                    prompt = build_aggregate_alteration_prompt(
+                        gold_sql=sample.SQL,
+                        db_ddl=db_ddl,
+                        gold_result=gold_result,
+                        alteration_type=decision.alteration_type,
+                        num_targets=num_targets,
+                    )
+                else:
+                    prompt = build_alteration_prompt(
+                        gold_sql=sample.SQL,
+                        db_ddl=db_ddl,
+                        gold_result=gold_result,
+                        targeted_records=targeted_records,
+                        alteration_type=decision.alteration_type,
+                    )
             else:
-                prompt = build_retry_prompt(
-                    previous_altering_sql=prev_altering_sql,
-                    previous_explanation=prev_explanation,
-                    error_message=(
-                        final_validation.error_message if final_validation else "Unknown"
-                    ),
-                    gold_sql=sample.SQL,
-                    db_ddl=db_ddl,
-                    gold_result=gold_result,
-                    altered_result=prev_altered_result,
-                    targeted_records=targeted_records,
-                    alteration_type=decision.alteration_type,
-                )
+                if is_aggregate:
+                    prompt = build_aggregate_retry_prompt(
+                        previous_altering_sql=prev_altering_sql,
+                        previous_explanation=prev_explanation,
+                        error_message=(
+                            final_validation.error_message if final_validation else "Unknown"
+                        ),
+                        gold_sql=sample.SQL,
+                        db_ddl=db_ddl,
+                        gold_result=gold_result,
+                        altered_result=prev_altered_result,
+                        alteration_type=decision.alteration_type,
+                        num_targets=num_targets,
+                    )
+                else:
+                    prompt = build_retry_prompt(
+                        previous_altering_sql=prev_altering_sql,
+                        previous_explanation=prev_explanation,
+                        error_message=(
+                            final_validation.error_message if final_validation else "Unknown"
+                        ),
+                        gold_sql=sample.SQL,
+                        db_ddl=db_ddl,
+                        gold_result=gold_result,
+                        altered_result=prev_altered_result,
+                        targeted_records=targeted_records,
+                        alteration_type=decision.alteration_type,
+                    )
                 logger.info(
                     "[%d] Retry — previous validation error: %s",
                     sample_idx,
@@ -477,16 +530,24 @@ class Pipeline:
                         )
 
                 if sandbox_ok and gold_on_sandbox_ok:
-                    this_validation = validate_alteration(
-                        gold_result=gold_result,
-                        altered_result=altered_result,
-                        targeted_records=targeted_records,
-                        alteration_type=decision.alteration_type,
-                    )
+                    if is_aggregate:
+                        this_validation = validate_alteration_aggregate(
+                            gold_result=gold_result,
+                            altered_result=altered_result,
+                        )
+                    else:
+                        this_validation = validate_alteration(
+                            gold_result=gold_result,
+                            altered_result=altered_result,
+                            targeted_records=targeted_records,
+                            alteration_type=decision.alteration_type,
+                        )
                     if this_validation.is_valid:
                         logger.info(
-                            "[%d] ✓ Validation PASSED — %d targeted record(s) removed",
-                            sample_idx, len(this_validation.missing_targeted),
+                            "[%d] ✓ Validation PASSED — %s",
+                            sample_idx,
+                            "aggregate result changed" if is_aggregate
+                            else f"{len(this_validation.missing_targeted)} targeted record(s) removed",
                         )
                     else:
                         logger.info(
@@ -879,11 +940,12 @@ class Pipeline:
         summary["elapsed_seconds"] = round(elapsed, 1)
         logger.info(
             "Pipeline done in %.1fs — %d success / %d processed "
-            "(skipped: %d empty, %d error, %d aggregate | "
+            "(skipped: %d empty, %d error | "
+            "aggregates processed: %d | "
             "failed: %d validation, %d fix_validation, %d LLM)",
             elapsed, self.stats.success, self.stats.processed,
             self.stats.skipped_empty, self.stats.skipped_error,
-            self.stats.skipped_aggregate,
+            self.stats.processed_aggregate,
             self.stats.failed_validation, self.stats.failed_fix_validation,
             self.stats.failed_llm,
         )
