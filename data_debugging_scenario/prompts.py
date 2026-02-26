@@ -344,25 +344,45 @@ Respond with JSON only:
 # ── Step 2: Follow-up Question & Explanation Prompt ────────────────────────────
 
 FOLLOWUP_SYSTEM_PROMPT = """\
-You are a database debugging expert helping a user understand why a SQL query \
-returned unexpected results due to corrupted/modified data.
+You are a database expert. Given a natural language question, its correct SQL \
+query, the expected result, and the actual (wrong) result the user is seeing, \
+you will generate three things.
 
-Given:
-- A natural language question about a database
-- The correct SQL query
-- The correct (gold) result
-- The altered (wrong) result caused by data modification
-- An explanation of what data was changed
+── Field instructions ──────────────────────────────────────────────────────
 
-Generate:
-1. A natural follow-up question the user would ask when seeing the wrong output
-2. A gold explanation that identifies the data corruption
-3. A SQL fix to restore the database to its correct state
+1. follow_up_question
+   A natural question the user would ask when they notice the wrong output \
+instead of the expected one (e.g. "Why is X missing?" or "Why does the count \
+show Y instead of Z?").
+
+2. gold_explanation
+   Answer the follow_up_question ONLY from the perspective of someone who can \
+query the current database and observe its data — as if they have no knowledge \
+that the data was ever changed or corrupted.
+   - For missing-record queries: state that the record simply does not exist in \
+the database (e.g. "There is no entry for X in the database.").
+   - For wrong-value queries: state that the column currently holds a different \
+value in the database (e.g. "The database shows Y for that field, not Z.").
+   - For aggregate queries: state how many matching rows currently exist in the \
+database (e.g. "Only N records matching those conditions are present in the \
+database, so the result is N.").
+   STRICT RULES for gold_explanation:
+   * Do NOT mention SQL statements, alterations, deletions, updates, or \
+data modifications of any kind.
+   * Do NOT say the data was changed, corrupted, removed, or tampered with.
+   * Do NOT reference any altering SQL or how the data came to be in this state.
+   * Simply describe what the database currently contains (or does not contain) \
+that explains the observed result.
+
+3. gold_fix
+   A SQL statement (INSERT or UPDATE) that reverses the alteration and restores \
+the database to the state where the gold SQL query returns the correct result. \
+You may use the alteration details provided to write this fix.
 
 OUTPUT FORMAT — respond with valid JSON only:
 {
   "follow_up_question": "<question>",
-  "gold_explanation": "<explanation>",
+  "gold_explanation": "<explanation as described above>",
   "gold_fix": "<SQL to reverse the alteration>"
 }\
 """
@@ -396,21 +416,19 @@ def build_followup_prompt(
 ## Correct (Gold) Result ({len(gold_result)} rows)
 {_format_rows(gold_result)}
 
-## Altered (Wrong) Result ({len(altered_result)} rows)
+## Current (Wrong) Result ({len(altered_result)} rows)
 {_format_rows(altered_result)}
 
-## What Was Changed
+## Alteration Details (use ONLY for generating gold_fix — do NOT reference in gold_explanation)
 - Alteration type: {alteration_type.value}
 - Targeted records: {json.dumps(targeted_records, ensure_ascii=False, default=str)}
 - Altering SQL: {altering_sql}
 - Explanation: {alteration_explanation}
 
-Based on the above, generate:
-1. A follow-up question a user would naturally ask when seeing the wrong output \
-instead of the correct one (e.g., "Why is X missing?" or "Why does the count \
-show Y instead of Z?")
-2. A gold explanation that precisely identifies the data issue
-3. A SQL fix (INSERT or UPDATE) that reverses the alteration
+Generate all three fields as described in the system prompt.
+Remember: gold_explanation must answer the follow_up_question purely by \
+describing what the current database data shows — no mention of alterations, \
+SQL changes, or data corruption.
 
 Respond with JSON only.\
 """
