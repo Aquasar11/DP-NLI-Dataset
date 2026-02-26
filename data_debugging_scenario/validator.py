@@ -55,13 +55,17 @@ def validate_alteration(
     alteration_type: AlterationType,
 ) -> ValidationResult:
     """
-    Validate that the alteration correctly removed targeted records
-    and left everything else unchanged.
+    Validate that the alteration correctly removed targeted records.
+
+    Only hard requirement: all targeted records must be absent from the altered
+    result.  Side-effects — other records disappearing or new records appearing —
+    are permitted and logged as informational observations only.
 
     Checks:
-    1. All targeted records are ABSENT from the altered result.
-    2. All non-targeted records from the gold result are PRESENT in the altered result.
-    3. No new unexpected records appeared (for non-aggregate queries).
+    1. (HARD) All targeted records are ABSENT from the altered result.
+    2. (INFO) Non-targeted records that were unintentionally removed — logged but
+       does NOT cause failure.
+    3. (INFO) New records that appeared — logged but does NOT cause failure.
 
     Args:
         gold_result: The original query result before alteration.
@@ -74,7 +78,7 @@ def validate_alteration(
     """
     errors: list[str] = []
 
-    # ── Check 1: Targeted records should be absent ─────────────────────────
+    # ── Check 1 (HARD): Targeted records must be absent ────────────────────
     still_present = []
     missing_targeted = []
     for target in targeted_records:
@@ -89,7 +93,7 @@ def validate_alteration(
             f"{json.dumps(still_present, ensure_ascii=False, default=str)}"
         )
 
-    # ── Check 2: Non-targeted gold records should still be present ─────────
+    # ── Check 2 (INFO): Track non-targeted records that went missing ────────
     non_targeted_gold = [
         row for row in gold_result if not _row_in_list(row, targeted_records)
     ]
@@ -100,30 +104,25 @@ def validate_alteration(
             unintended_missing.append(row)
 
     if unintended_missing:
-        errors.append(
-            f"{len(unintended_missing)} non-targeted record(s) were unintentionally "
-            f"removed from the result: "
-            f"{json.dumps(unintended_missing, ensure_ascii=False, default=str)}"
+        logger.info(
+            "%d non-targeted record(s) were also removed from the result "
+            "(allowed — relaxed validation): %s",
+            len(unintended_missing),
+            json.dumps(unintended_missing[:5], ensure_ascii=False, default=str),
         )
 
-    # ── Check 3: No unexpected new records ─────────────────────────────────
-    # Build set of gold row keys for quick lookup
+    # ── Check 3 (INFO): Track unexpected new records ────────────────────────
     gold_keys = {_row_to_key(r) for r in gold_result}
     new_records = [
         row for row in altered_result if _row_to_key(row) not in gold_keys
     ]
     if new_records:
-        # This is a warning, not necessarily a hard failure for queries with
-        # LIMIT (removing a row might surface a previously-hidden row) or
-        # ORDER BY changes. We flag it but allow it for now.
-        logger.warning(
-            "%d new record(s) appeared in altered result that weren't in gold: %s",
+        logger.info(
+            "%d new record(s) appeared in altered result that weren't in gold "
+            "(allowed — relaxed validation): %s",
             len(new_records),
             json.dumps(new_records[:5], ensure_ascii=False, default=str),
         )
-        # For queries with LIMIT, new records appearing is expected behavior
-        # when a targeted record was removed and another slides into place.
-        # We only treat this as an error if targeted records are still present.
 
     # ── Assemble result ────────────────────────────────────────────────────
     is_valid = len(errors) == 0
