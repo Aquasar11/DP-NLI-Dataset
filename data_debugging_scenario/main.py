@@ -25,7 +25,7 @@ from pathlib import Path
 
 import config
 from db_manager import DatabaseManager
-from llm_client import LLMClient
+from llm_client import GeminiClient, LLMClient
 from pipeline import Pipeline
 
 
@@ -37,22 +37,35 @@ def parse_args() -> argparse.Namespace:
 
     # ── LLM settings ──────────────────────────────────────────────────────
     parser.add_argument(
+        "--provider",
+        type=str,
+        default="openai",
+        choices=["openai", "gemini"],
+        help="LLM provider to use",
+    )
+    parser.add_argument(
         "--model",
         type=str,
         default=None,
-        help="OpenAI model to use (overrides OPENAI_MODEL env var)",
+        help="Model name (overrides OPENAI_MODEL / GEMINI_MODEL env var)",
     )
     parser.add_argument(
         "--api-key",
         type=str,
         default=None,
-        help="OpenAI API key (overrides OPENAI_API_KEY env var)",
+        help="API key (overrides OPENAI_API_KEY / GEMINI_API_KEY env var)",
     )
     parser.add_argument(
         "--base-url",
         type=str,
         default=None,
-        help="OpenAI API base URL (overrides OPENAI_BASE_URL env var)",
+        help="OpenAI API base URL (overrides OPENAI_BASE_URL env var; ignored for Gemini)",
+    )
+    parser.add_argument(
+        "--use-vertexai",
+        action="store_true",
+        default=False,
+        help="Route Gemini requests through Vertex AI (ignored for OpenAI)",
     )
     parser.add_argument(
         "--temperature",
@@ -158,12 +171,20 @@ def main() -> None:
         sandbox_dir=Path(args.output_dir).parent / "sandbox",
     )
 
-    llm_client = LLMClient(
-        api_key=args.api_key,
-        model=args.model,
-        base_url=args.base_url,
-        temperature=args.temperature,
-    )
+    if args.provider == "gemini":
+        llm_client = GeminiClient(
+            api_key=args.api_key,
+            model=args.model,
+            temperature=args.temperature,
+            use_vertexai=args.use_vertexai or None,
+        )
+    else:
+        llm_client = LLMClient(
+            api_key=args.api_key,
+            model=args.model,
+            base_url=args.base_url,
+            temperature=args.temperature,
+        )
 
     pipeline = Pipeline(
         db_manager=db_manager,
