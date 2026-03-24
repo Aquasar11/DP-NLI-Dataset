@@ -19,7 +19,9 @@ import json
 import logging
 import random
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -141,6 +143,7 @@ class Pipeline:
         max_retries: int | None = None,
         seed: int | None = None,
         output_dir: Path | None = None,
+        max_workers: int | None = None,
     ) -> None:
         self.db = db_manager or DatabaseManager()
         self.llm = llm_client
@@ -155,8 +158,22 @@ class Pipeline:
         self.seed = seed if seed is not None else config.RANDOM_SEED
         self.output_dir = output_dir or config.OUTPUT_DIR
         self.rng = random.Random(self.seed)
+        self.max_workers = max_workers if max_workers is not None else 1
         self.stats = PipelineStats()
         self.sample_logger: SampleLogger | None = None
+        # Thread-safety primitives
+        self._log_lock = threading.Lock()      # serialises SampleLogger file writes
+        self._record_id_lock = threading.Lock()  # atomic record-id counter
+        self._next_record_id = 1
+
+    # ── Record ID allocation ──────────────────────────────────────────────
+
+    def _alloc_record_id(self) -> int:
+        """Return the next record id atomically."""
+        with self._record_id_lock:
+            rid = self._next_record_id
+            self._next_record_id += 1
+            return rid
 
     # ── Data Loading ───────────────────────────────────────────────────────
 
@@ -177,6 +194,7 @@ class Pipeline:
         gold_result: list[dict[str, Any]],
         sample_idx: int,
         is_aggregate: bool = False,
+        rng: random.Random | None = None,
     ) -> tuple[AlterationDecision, AlterationDecisionLog]:
         """
         Randomly decide the alteration strategy and log every factor.
@@ -189,8 +207,9 @@ class Pipeline:
 
         Returns both the AlterationDecision and a detailed AlterationDecisionLog.
         """
+        _rng = rng if rng is not None else self.rng
         # Draw random value and decide delete vs. modify
-        rand_draw = self.rng.random()
+        rand_draw = _rng.random()
         if rand_draw < self.delete_prob:
             alt_type = AlterationType.DELETE
         else:
@@ -206,7 +225,7 @@ class Pipeline:
         if is_aggregate:
             # For aggregate queries num_targets = number of underlying rows to alter;
             # the single aggregate result row is always the "targeted" record.
-            num_targets = self.rng.randint(1, self.max_targets)
+            num_targets = _rng.randint(1, self.max_targets)
             target_indices: list[int] = []
             targeted_records = [gold_result[0]]
             logger.info(
@@ -216,8 +235,8 @@ class Pipeline:
             )
         else:
             max_t = min(self.max_targets, num_result_rows)
-            num_targets = self.rng.randint(1, max_t)
-            target_indices = sorted(self.rng.sample(range(num_result_rows), num_targets))
+            num_targets = _rng.randint(1, max_t)
+            target_indices = sorted(_rng.sample(range(num_result_rows), num_targets))
             targeted_records = [gold_result[i] for i in target_indices]
             logger.info(
                 "[%d] Decision — targets: result_rows=%d, max_targets_config=%d, "
@@ -250,7 +269,6 @@ class Pipeline:
         self,
         sample: BirdSample,
         sample_idx: int,
-        record_id: int,
     ) -> DatasetRecord | None:
         """
         Process a single BIRD sample through the full pipeline.
@@ -259,6 +277,8 @@ class Pipeline:
         SampleLog and written incrementally via SampleLogger.
         Returns a DatasetRecord on success, None on skip/failure.
         """
+        # Per-sample RNG: deterministic per index, isolated across threads
+        sample_rng = random.Random(self.seed + sample_idx)
         self.stats.processed += 1
         t_start = time.perf_counter()
         ts_start = datetime.datetime.utcnow().isoformat() + "Z"
@@ -297,7 +317,8 @@ class Pipeline:
         def _emit(status: str, skip_reason: str | None = None) -> None:
             base["total_duration_seconds"] = round(time.perf_counter() - t_start, 3)
             if self.sample_logger:
-                self.sample_logger.write(SampleLog(status=status, skip_reason=skip_reason, **base))
+                with self._log_lock:
+                    self.sample_logger.write(SampleLog(status=status, skip_reason=skip_reason, **base))
 
         # ── 1. Resolve DB path ─────────────────────────────────────────────
         db_path = self.db.get_db_path(sample.db_id)
@@ -345,7 +366,7 @@ class Pipeline:
 
         # ── 5. Alteration decision ─────────────────────────────────────────
         decision, decision_log = self.make_alteration_decision(
-            gold_result, sample_idx, is_aggregate=is_aggregate
+            gold_result, sample_idx, is_aggregate=is_aggregate, rng=sample_rng
         )
         targeted_records = [gold_result[i] for i in decision.target_record_indices]
         base["alteration_decision"] = decision_log
@@ -669,6 +690,7 @@ class Pipeline:
         base["step2_follow_up_question"] = followup_response.follow_up_question
 
         # ── 10. Assemble and return DatasetRecord ──────────────────────────
+        record_id = self._alloc_record_id()
         record = DatasetRecord(
             id=record_id,
             db_id=sample.db_id,
@@ -722,17 +744,29 @@ class Pipeline:
         self.sample_logger = SampleLogger(self.output_dir)
 
         results: list[DatasetRecord] = []
-        record_id = 1
+        self._next_record_id = 1  # reset counter for this run
 
         try:
-            for idx, sample in enumerate(tqdm(samples, desc="Processing samples")):
-                record = self.process_sample(sample, idx, record_id)
-                if record is not None:
-                    results.append(record)
-                    record_id += 1
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {
+                    executor.submit(self.process_sample, sample, idx): idx
+                    for idx, sample in enumerate(samples)
+                }
+                for future in tqdm(
+                    as_completed(futures), total=len(samples), desc="Processing samples"
+                ):
+                    try:
+                        record = future.result()
+                    except Exception as exc:
+                        logger.error("Unexpected worker error: %s", exc)
+                        record = None
+                    if record is not None:
+                        results.append(record)
         finally:
             self.db.cleanup_all_sandboxes()
             self.sample_logger.consolidate()
+
+        results.sort(key=lambda r: r.id)
 
         elapsed = time.time() - start_time
         self._save_results(results)

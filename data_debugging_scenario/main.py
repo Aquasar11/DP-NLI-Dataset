@@ -105,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         default=config.RANDOM_SEED,
         help="Random seed for reproducibility",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=10,
+        help="Number of parallel worker threads",
+    )
 
     # ── Paths ─────────────────────────────────────────────────────────────
     parser.add_argument(
@@ -195,6 +201,7 @@ def main() -> None:
         max_retries=args.max_retries,
         seed=args.seed,
         output_dir=Path(args.output_dir),
+        max_workers=args.workers,
     )
 
     # ── Log configuration ─────────────────────────────────────────────────
@@ -204,6 +211,7 @@ def main() -> None:
     logger.info("Max target records: %d", args.max_targets)
     logger.info("Max retries: %d", args.max_retries)
     logger.info("Random seed: %d", args.seed)
+    logger.info("Workers: %d", args.workers)
     logger.info("Output directory: %s", args.output_dir)
     logger.info("-" * 60)
 
