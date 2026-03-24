@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -70,22 +70,6 @@ class AlterationDecisionLog:
     random_draw: float
 
 
-@dataclass
-class FixAttemptLog:
-    """One Step-3 attempt: apply fix SQL on sandbox + verify vs original."""
-
-    attempt: int
-    llm_call: LLMCallLog | None  # None for the initial fix from Step 2
-    fix_sql: str
-    sandbox_execute_success: bool
-    sandbox_execute_error: str | None
-    gold_sql_on_sandbox_success: bool
-    gold_sql_on_sandbox_error: str | None
-    result_after_fix: list[dict[str, Any]]
-    matches_original: bool
-    mismatch_details: str | None
-
-
 # ── Top-level per-sample record ────────────────────────────────────────────
 
 
@@ -119,15 +103,7 @@ class SampleLog:
     # Step 2
     step2_llm_call: LLMCallLog | None
     step2_follow_up_question: str | None
-    step2_gold_explanation: str | None
-    step2_gold_fix: str | None
     step2_passed: bool
-
-    # Step 3 — Fix verification
-    step3_fix_attempts: list[FixAttemptLog]
-    step3_total_attempts: int
-    step3_final_fix_sql: str | None
-    step3_passed: bool
 
     # Outcome
     status: str  # success | skipped_empty | skipped_error | skipped_aggregate
@@ -196,33 +172,6 @@ def make_attempt_log(
     )
 
 
-def make_fix_attempt_log(
-    *,
-    attempt: int,
-    llm_call: LLMCallLog | None,
-    fix_sql: str,
-    sandbox_execute_success: bool,
-    sandbox_execute_error: str | None,
-    gold_sql_on_sandbox_success: bool,
-    gold_sql_on_sandbox_error: str | None,
-    result_after_fix: list[dict[str, Any]],
-    matches_original: bool,
-    mismatch_details: str | None,
-) -> FixAttemptLog:
-    return FixAttemptLog(
-        attempt=attempt,
-        llm_call=llm_call,
-        fix_sql=fix_sql,
-        sandbox_execute_success=sandbox_execute_success,
-        sandbox_execute_error=sandbox_execute_error,
-        gold_sql_on_sandbox_success=gold_sql_on_sandbox_success,
-        gold_sql_on_sandbox_error=gold_sql_on_sandbox_error,
-        result_after_fix=result_after_fix,
-        matches_original=matches_original,
-        mismatch_details=mismatch_details,
-    )
-
-
 # ── Writer ─────────────────────────────────────────────────────────────────
 
 
@@ -279,5 +228,7 @@ class SampleLogger:
             with open(json_path, "w", encoding="utf-8") as fh:
                 json.dump(records, fh, indent=2, ensure_ascii=False, default=str)
             logger.info(
-                "Consolidated %d records → %s", len(records), json_path,
+                "Consolidated %d records → %s",
+                len(records),
+                json_path,
             )

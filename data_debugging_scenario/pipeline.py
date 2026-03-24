@@ -39,19 +39,15 @@ from prompts import (
     build_aggregate_alteration_prompt,
     build_aggregate_retry_prompt,
     build_alteration_prompt,
-    build_fix_retry_prompt,
     build_followup_prompt,
     build_retry_prompt,
 )
 from sample_logger import (
     AlterationDecisionLog,
     AttemptLog,
-    FixAttemptLog,
-    LLMCallLog,
     SampleLog,
     SampleLogger,
     make_attempt_log,
-    make_fix_attempt_log,
     make_llm_call_log,
 )
 from validator import (
@@ -115,7 +111,6 @@ class PipelineStats:
         self.skipped_error = 0
         self.processed_aggregate = 0
         self.failed_validation = 0
-        self.failed_fix_validation = 0
         self.failed_llm = 0
 
     def summary(self) -> dict[str, Any]:
@@ -127,7 +122,6 @@ class PipelineStats:
             "skipped_query_error": self.skipped_error,
             "processed_aggregate": self.processed_aggregate,
             "failed_validation_after_retries": self.failed_validation,
-            "failed_fix_validation_after_retries": self.failed_fix_validation,
             "failed_llm_error": self.failed_llm,
             "success_rate": f"{self.success / max(self.processed, 1) * 100:.1f}%",
         }
@@ -295,13 +289,7 @@ class Pipeline:
             step1_passed=False,
             step2_llm_call=None,
             step2_follow_up_question=None,
-            step2_gold_explanation=None,
-            step2_gold_fix=None,
             step2_passed=False,
-            step3_fix_attempts=[],
-            step3_total_attempts=0,
-            step3_final_fix_sql=None,
-            step3_passed=False,
             total_duration_seconds=0.0,
             timestamp_start=ts_start,
         )
@@ -672,198 +660,13 @@ class Pipeline:
         followup_response = followup_result.parsed
         logger.info(
             "[%d] Step 2 response (%.2fs)\n"
-            "  follow_up_question : %s\n"
-            "  gold_explanation   : %s\n"
-            "  gold_fix           : %s",
+            "  follow_up_question : %s\n",
             sample_idx, followup_result.duration_seconds,
             followup_response.follow_up_question,
-            followup_response.gold_explanation,
-            followup_response.gold_fix,
         )
 
         base["step2_passed"] = True
         base["step2_follow_up_question"] = followup_response.follow_up_question
-        base["step2_gold_explanation"] = followup_response.gold_explanation
-        base["step2_gold_fix"] = followup_response.gold_fix
-
-        # ── 9. Step 3: verify fix SQL restores original state ──────────────
-        logger.info("[%d] ── Step 3: fix SQL verification ───────────────────", sample_idx)
-
-        step3_attempts: list[FixAttemptLog] = []
-        current_fix_sql = followup_response.gold_fix
-        fix_verified = False
-
-        for fix_attempt in range(1, self.max_retries + 1):
-            logger.info(
-                "[%d] ── Step 3 attempt %d/%d ──────────────────",
-                sample_idx, fix_attempt, self.max_retries,
-            )
-
-            # Create sandbox: apply the alteration, then apply the fix
-            sandbox_path = self.db.create_sandbox(sample.db_id)
-            fix_exec_ok = False
-            fix_exec_err: str | None = None
-            gold_after_fix_ok = False
-            gold_after_fix_err: str | None = None
-            result_after_fix: list[dict[str, Any]] = []
-            matches_original = False
-            mismatch_details: str | None = None
-
-            try:
-                # Apply the alteration SQL (already validated in Step 1)
-                try:
-                    self.db.execute_alter(sandbox_path, final_alteration_result.altering_sql)
-                    logger.debug("[%d] Alteration re-applied on fix sandbox ✓", sample_idx)
-                except sqlite3.Error as e:
-                    fix_exec_err = f"Re-applying alteration failed: {e}"
-                    logger.error("[%d] %s", sample_idx, fix_exec_err)
-                    mismatch_details = fix_exec_err
-                    step3_attempts.append(make_fix_attempt_log(
-                        attempt=fix_attempt,
-                        llm_call=None if fix_attempt == 1 else step3_attempts[-1].llm_call,
-                        fix_sql=current_fix_sql,
-                        sandbox_execute_success=False,
-                        sandbox_execute_error=fix_exec_err,
-                        gold_sql_on_sandbox_success=False,
-                        gold_sql_on_sandbox_error=None,
-                        result_after_fix=[],
-                        matches_original=False,
-                        mismatch_details=fix_exec_err,
-                    ))
-                    break  # alteration re-apply failure is not retryable
-
-                # Apply the fix SQL
-                try:
-                    self.db.execute_alter(sandbox_path, current_fix_sql)
-                    fix_exec_ok = True
-                    logger.info("[%d] Fix SQL executed on sandbox ✓", sample_idx)
-                except sqlite3.Error as e:
-                    fix_exec_err = str(e)
-                    logger.warning("[%d] Fix SQL FAILED on sandbox: %s", sample_idx, e)
-
-                # Run gold SQL on the fixed sandbox
-                if fix_exec_ok:
-                    try:
-                        fixed_obj = self.db.execute_query(sandbox_path, sample.SQL)
-                        result_after_fix = fixed_obj.rows
-                        gold_after_fix_ok = True
-                        logger.info(
-                            "[%d] Gold SQL on fixed sandbox → %d row(s) | preview: %s",
-                            sample_idx, len(result_after_fix), result_after_fix[:3],
-                        )
-                    except sqlite3.Error as e:
-                        gold_after_fix_err = str(e)
-                        logger.warning(
-                            "[%d] Gold SQL on fixed sandbox FAILED: %s", sample_idx, e,
-                        )
-
-                # Compare with original gold_result
-                if fix_exec_ok and gold_after_fix_ok:
-                    matches_original, mismatch_details = _compare_results(
-                        gold_result, result_after_fix,
-                    )
-                    if matches_original:
-                        logger.info(
-                            "[%d] ✓ Fix verification PASSED — sandbox restored to original state",
-                            sample_idx,
-                        )
-                    else:
-                        logger.info(
-                            "[%d] ✗ Fix verification FAILED: %s",
-                            sample_idx, mismatch_details,
-                        )
-                else:
-                    mismatch_details = fix_exec_err or gold_after_fix_err or "Unknown error"
-
-            finally:
-                self.db.destroy_sandbox(sandbox_path)
-                logger.debug("[%d] Fix sandbox destroyed", sample_idx)
-
-            # Build the LLM call log for retry attempts (None for first attempt)
-            fix_llm_log: LLMCallLog | None = None
-            if fix_attempt > 1 and hasattr(self, "_last_fix_llm_result"):
-                fix_llm_log = self._last_fix_llm_result
-
-            step3_attempts.append(make_fix_attempt_log(
-                attempt=fix_attempt,
-                llm_call=fix_llm_log,
-                fix_sql=current_fix_sql,
-                sandbox_execute_success=fix_exec_ok,
-                sandbox_execute_error=fix_exec_err,
-                gold_sql_on_sandbox_success=gold_after_fix_ok,
-                gold_sql_on_sandbox_error=gold_after_fix_err,
-                result_after_fix=result_after_fix,
-                matches_original=matches_original,
-                mismatch_details=mismatch_details,
-            ))
-
-            if matches_original:
-                fix_verified = True
-                break
-
-            # Not the last attempt → ask LLM for a corrected fix
-            if fix_attempt < self.max_retries:
-                logger.info(
-                    "[%d] Requesting corrected fix from LLM…", sample_idx,
-                )
-                retry_prompt = build_fix_retry_prompt(
-                    gold_sql=sample.SQL,
-                    db_ddl=db_ddl,
-                    gold_result=gold_result,
-                    altering_sql=final_alteration_result.altering_sql,
-                    alteration_explanation=final_alteration_result.explanation,
-                    previous_fix_sql=current_fix_sql,
-                    fix_execution_error=fix_exec_err,
-                    result_after_fix=result_after_fix,
-                    result_mismatch_details=mismatch_details or "Unknown mismatch",
-                )
-                fix_retry_result = self.llm.generate_fix_retry(retry_prompt)
-
-                self._last_fix_llm_result = make_llm_call_log(
-                    step="fix_step3", attempt=fix_attempt + 1,
-                    system_prompt=fix_retry_result.system_prompt,
-                    user_prompt=fix_retry_result.user_prompt,
-                    raw_response=fix_retry_result.raw_response,
-                    parsed_response=fix_retry_result.parsed_dict,
-                    success=fix_retry_result.success,
-                    error=fix_retry_result.error,
-                    duration_seconds=fix_retry_result.duration_seconds,
-                )
-
-                if not fix_retry_result.success:
-                    logger.error(
-                        "[%d] Fix retry LLM call FAILED: %s",
-                        sample_idx, fix_retry_result.error,
-                    )
-                    continue
-
-                current_fix_sql = fix_retry_result.parsed.gold_fix
-                logger.info(
-                    "[%d] LLM provided corrected fix SQL (%.2fs): %s",
-                    sample_idx, fix_retry_result.duration_seconds, current_fix_sql,
-                )
-
-        base["step3_fix_attempts"] = step3_attempts
-        base["step3_total_attempts"] = len(step3_attempts)
-
-        if not fix_verified:
-            logger.info(
-                "[%d] Step 3 FAILED after %d attempt(s): fix SQL does not restore original state",
-                sample_idx, len(step3_attempts),
-            )
-            self.stats.failed_fix_validation += 1
-            base["step3_passed"] = False
-            _emit(
-                "failed_fix_validation",
-                f"Fix verification failed after {len(step3_attempts)} retries: {mismatch_details}",
-            )
-            return None
-
-        base["step3_passed"] = True
-        base["step3_final_fix_sql"] = current_fix_sql
-        logger.info(
-            "[%d] Step 3 complete ✓  (%d attempt(s))", sample_idx, len(step3_attempts),
-        )
 
         # ── 10. Assemble and return DatasetRecord ──────────────────────────
         record = DatasetRecord(
@@ -880,8 +683,6 @@ class Pipeline:
             altered_result=final_altered_result,
             alteration_explanation=final_alteration_result.explanation,
             follow_up_question=followup_response.follow_up_question,
-            gold_explanation=followup_response.gold_explanation,
-            gold_fix=current_fix_sql,
         )
 
         base["record_id"] = record_id
@@ -942,11 +743,11 @@ class Pipeline:
             "Pipeline done in %.1fs — %d success / %d processed "
             "(skipped: %d empty, %d error | "
             "aggregates processed: %d | "
-            "failed: %d validation, %d fix_validation, %d LLM)",
+            "failed: %d validation, %d LLM)",
             elapsed, self.stats.success, self.stats.processed,
             self.stats.skipped_empty, self.stats.skipped_error,
             self.stats.processed_aggregate,
-            self.stats.failed_validation, self.stats.failed_fix_validation,
+            self.stats.failed_validation,
             self.stats.failed_llm,
         )
         self._save_stats(summary)

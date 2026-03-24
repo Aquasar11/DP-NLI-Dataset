@@ -70,22 +70,6 @@ class LLMFollowUpResponse(BaseModel):
     follow_up_question: str = Field(
         description="A natural follow-up question a user would ask when seeing the altered (wrong) output"
     )
-    gold_explanation: str = Field(
-        description="The gold explanation answering the follow-up question, referencing the specific data change"
-    )
-    gold_fix: str = Field(
-        description="SQL statement(s) to reverse the alteration and restore the original database state"
-    )
-
-
-class LLMFixResponse(BaseModel):
-    """Structured output from the LLM for Step 3 retry: corrected fix SQL."""
-    gold_fix: str = Field(
-        description="Corrected SQL statement(s) to reverse the alteration and restore the original database state"
-    )
-    explanation: str = Field(
-        description="Why this corrected fix SQL works"
-    )
 
 
 # ── Validation Models ─────────────────────────────────────────────────────────
@@ -125,5 +109,3 @@ class DatasetRecord(BaseModel):
     altered_result: list[dict[str, Any]]
     alteration_explanation: str
     follow_up_question: str
-    gold_explanation: str
-    gold_fix: str

@@ -3,7 +3,7 @@ Prompt templates for LLM interactions.
 
 Two-step prompting:
   Step 1 – Generate altering SQL + explanation (validated before proceeding)
-  Step 2 – Generate follow-up question, gold explanation, and gold fix
+  Step 2 – Generate follow-up question
 """
 
 from __future__ import annotations
@@ -69,14 +69,12 @@ database so that specific records disappear from a query's result.
 
 RULES:
 1. Only output valid SQLite-compatible SQL (DELETE or UPDATE statements).
-2. The alteration must ONLY affect the targeted records — no other rows in the \
-query result should be added, removed, or changed.
-3. Be precise: use primary keys or unique identifiers when possible to target \
+2. Be precise: use primary keys or unique identifiers when possible to target \
 exact rows.
-4. If the query involves JOINs, identify which table's row needs to change.
-5. For UPDATE (modify) operations, change column values so the row no longer \
+3. If the query involves JOINs, identify which table's row needs to change.
+4. For UPDATE (modify) operations, change column values so the row no longer \
 matches the WHERE, JOIN, or HAVING conditions of the gold query.
-6. Multiple SQL statements should be separated by semicolons.
+5. Multiple SQL statements should be separated by semicolons.
 
 OUTPUT FORMAT — respond with valid JSON only:
 {
@@ -341,12 +339,12 @@ Respond with JSON only:
 """
 
 
-# ── Step 2: Follow-up Question & Explanation Prompt ────────────────────────────
+# ── Step 2: Follow-up Question ────────────────────────────
 
 FOLLOWUP_SYSTEM_PROMPT = """\
 You are a database expert. Given a natural language question, its correct SQL \
 query, the expected result, and the actual (wrong) result the user is seeing, \
-you will generate three things.
+you will generate one thing.
 
 ── Field instructions ──────────────────────────────────────────────────────
 
@@ -355,35 +353,9 @@ you will generate three things.
 instead of the expected one (e.g. "Why is X missing?" or "Why does the count \
 show Y instead of Z?").
 
-2. gold_explanation
-   Answer the follow_up_question ONLY from the perspective of someone who can \
-query the current database and observe its data — as if they have no knowledge \
-that the data was ever changed or corrupted.
-   - For missing-record queries: state that the record simply does not exist in \
-the database (e.g. "There is no entry for X in the database.").
-   - For wrong-value queries: state that the column currently holds a different \
-value in the database (e.g. "The database shows Y for that field, not Z.").
-   - For aggregate queries: state how many matching rows currently exist in the \
-database (e.g. "Only N records matching those conditions are present in the \
-database, so the result is N.").
-   STRICT RULES for gold_explanation:
-   * Do NOT mention SQL statements, alterations, deletions, updates, or \
-data modifications of any kind.
-   * Do NOT say the data was changed, corrupted, removed, or tampered with.
-   * Do NOT reference any altering SQL or how the data came to be in this state.
-   * Simply describe what the database currently contains (or does not contain) \
-that explains the observed result.
-
-3. gold_fix
-   A SQL statement (INSERT or UPDATE) that reverses the alteration and restores \
-the database to the state where the gold SQL query returns the correct result. \
-You may use the alteration details provided to write this fix.
-
 OUTPUT FORMAT — respond with valid JSON only:
 {
   "follow_up_question": "<question>",
-  "gold_explanation": "<explanation as described above>",
-  "gold_fix": "<SQL to reverse the alteration>"
 }\
 """
 
@@ -419,100 +391,7 @@ def build_followup_prompt(
 ## Current (Wrong) Result ({len(altered_result)} rows)
 {_format_rows(altered_result)}
 
-## Alteration Details (use ONLY for generating gold_fix — do NOT reference in gold_explanation)
-- Alteration type: {alteration_type.value}
-- Targeted records: {json.dumps(targeted_records, ensure_ascii=False, default=str)}
-- Altering SQL: {altering_sql}
-- Explanation: {alteration_explanation}
-
-Generate all three fields as described in the system prompt.
-Remember: gold_explanation must answer the follow_up_question purely by \
-describing what the current database data shows — no mention of alterations, \
-SQL changes, or data corruption.
+Generate the response as described in the system prompt.
 
 Respond with JSON only.\
-"""
-
-
-# ── Step 3: Fix SQL Retry Prompt ───────────────────────────────────────────────
-
-FIX_RETRY_SYSTEM_PROMPT = """\
-You are a database expert. Your task is to write SQL statements that REVERSE \
-a previous database alteration, restoring the database to its original state.
-
-RULES:
-1. Only output valid SQLite-compatible SQL (INSERT or UPDATE statements).
-2. The fix must restore EXACTLY the original query result — no extra or missing rows.
-3. Be precise: use the correct table, column names, and values from the original data.
-4. If the alteration was a DELETE, use INSERT to restore the deleted row(s).
-5. If the alteration was an UPDATE, use UPDATE to restore the original column values.
-6. Multiple SQL statements should be separated by semicolons.
-
-OUTPUT FORMAT — respond with valid JSON only:
-{
-  "gold_fix": "<SQL statement(s) to reverse the alteration>",
-  "explanation": "<why this fix restores the original state>"
-}\
-"""
-
-
-def build_fix_retry_prompt(
-    *,
-    gold_sql: str,
-    db_ddl: str,
-    gold_result: list[dict[str, Any]],
-    altering_sql: str,
-    alteration_explanation: str,
-    previous_fix_sql: str,
-    fix_execution_error: str | None,
-    result_after_fix: list[dict[str, Any]],
-    result_mismatch_details: str,
-) -> str:
-    """Build a retry prompt when the previous fix SQL failed verification."""
-    error_section = ""
-    if fix_execution_error:
-        error_section = f"""\n## Execution Error\n{fix_execution_error}\n"""
-
-    return f"""\
-Your previous fix SQL did NOT correctly restore the database to its original state. \
-Please provide a corrected fix.
-
-## Database Schema (DDL)
-```sql
-{db_ddl}
-```
-
-## Gold SQL Query
-```sql
-{gold_sql}
-```
-
-## Original (Correct) Query Result ({len(gold_result)} rows)
-{_format_rows(gold_result)}
-
-## Alteration That Was Applied
-```sql
-{altering_sql}
-```
-Explanation: {alteration_explanation}
-
-## Your Previous Fix Attempt
-```sql
-{previous_fix_sql}
-```
-{error_section}
-## Result After Your Fix ({len(result_after_fix)} rows)
-{_format_rows(result_after_fix)}
-
-## Why It Failed
-{result_mismatch_details}
-
-Please provide a CORRECTED fix SQL that will restore the database so that the \
-gold SQL query returns EXACTLY the original result.
-
-Respond with JSON only:
-{{
-  "gold_fix": "<corrected fix SQL>",
-  "explanation": "<why this corrected fix works>"
-}}\
 """

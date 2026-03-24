@@ -9,7 +9,7 @@ To the best of our knowledge, no existing dataset supports the combination of:
 - Provenance explanation (why is the output wrong?)
 - Corrective action (how to fix the data?)
 
-This tool constructs such a dataset by extending a seed text-to-SQL dataset (BIRD-Bench) with controlled data errors, follow-up questions, and gold explanations.
+This tool constructs such a dataset by extending a seed text-to-SQL dataset (BIRD-Bench) with controlled data errors and follow-up questions.
 
 ## What Each Dataset Instance Contains
 
@@ -27,8 +27,6 @@ This tool constructs such a dataset by extending a seed text-to-SQL dataset (BIR
 | `altered_result` | Query result on the corrupted database |
 | `alteration_explanation` | Why the altering SQL causes the targeted records to disappear |
 | `follow_up_question` | A natural question a user would ask when seeing the wrong output |
-| `gold_explanation` | Gold answer identifying the data corruption |
-| `gold_fix` | SQL to reverse the alteration and restore the database |
 
 ## Dataset Construction Methodology
 
@@ -42,7 +40,7 @@ For each seed sample from BIRD-Bench:
 4. **Generate** an altering SQL via LLM (DELETE or UPDATE statement)
 5. **Validate** in an isolated sandbox database copy — verify that *only* the targeted records are removed
 6. **Retry** up to 3× with error feedback if validation fails
-7. **Generate** a follow-up question, gold explanation, and gold fix via a second LLM call
+7. **Generate** a follow-up question via a second LLM call
 8. **Save** the complete record; destroy the sandbox
 
 Each instance maintains an isolated altered database state, reconstructable via the recorded `altering_sql`.
@@ -164,7 +162,7 @@ The pipeline uses two separate LLM calls per sample to avoid wasting tokens on i
 
 1. **Step 1 — Alteration SQL Generation**: Given the gold SQL, database DDL, query result, targeted records, and alteration type, the LLM generates a DELETE/UPDATE statement and an explanation. This is validated in a sandbox before proceeding.
 
-2. **Step 2 — Follow-up Q&A Generation**: Only after validation passes, the LLM generates a natural follow-up question, a gold explanation of the data corruption, and a SQL fix to reverse the alteration.
+2. **Step 2 — Follow-up Q&A Generation**: Only after validation passes, the LLM generates a natural follow-up question.
 
 ### Sandbox Isolation
 
@@ -219,8 +217,6 @@ The pipeline automatically skips samples that are not suitable for data debuggin
     "altered_result": [{"movie_title": "Children of Paradise"}],
     "alteration_explanation": "Deleting 'Brief Encounter' removes it from the 1945 movies, causing the next most popular movie to appear.",
     "follow_up_question": "Why does the result show 'Children of Paradise' instead of 'Brief Encounter'?",
-    "gold_explanation": "The row for 'Brief Encounter' was deleted from the movies table...",
-    "gold_fix": "INSERT INTO movies (...) VALUES (...)"
   }
 ]
 ```

@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
 from google import genai
@@ -19,10 +19,9 @@ from google.oauth2 import service_account
 from openai import OpenAI, APIError, RateLimitError, APITimeoutError
 
 import config
-from models import LLMAlterationResponse, LLMFixResponse, LLMFollowUpResponse
+from models import LLMAlterationResponse, LLMFollowUpResponse
 from prompts import (
     ALTERATION_SYSTEM_PROMPT,
-    FIX_RETRY_SYSTEM_PROMPT,
     FOLLOWUP_SYSTEM_PROMPT,
 )
 
@@ -202,39 +201,6 @@ class LLMClient:
                 error=str(e),
             )
 
-    def generate_fix_retry(self, user_prompt: str) -> LLMCallResult[LLMFixResponse]:
-        """
-        Step 3 retry: Generate a corrected fix SQL.
-
-        Uses FIX_RETRY_SYSTEM_PROMPT to ask the LLM to fix a previously
-        failed gold_fix SQL.  Returns an LLMCallResult wrapping the parsed
-        LLMFixResponse.
-        """
-        try:
-            raw, duration = self._call_api(FIX_RETRY_SYSTEM_PROMPT, user_prompt)
-            data = self._parse_json(raw)
-            parsed = LLMFixResponse(**data)
-            return LLMCallResult(
-                parsed=parsed,
-                system_prompt=FIX_RETRY_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                raw_response=raw,
-                parsed_dict=data,
-                duration_seconds=round(duration, 3),
-                success=True,
-            )
-        except Exception as e:
-            return LLMCallResult(
-                parsed=None,
-                system_prompt=FIX_RETRY_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                raw_response=None,
-                parsed_dict=None,
-                duration_seconds=0.0,
-                success=False,
-                error=str(e),
-            )
-
 
 # Retryable HTTP status codes for the Gemini API
 _GEMINI_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -387,33 +353,6 @@ class GeminiClient:
             return LLMCallResult(
                 parsed=None,
                 system_prompt=FOLLOWUP_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                raw_response=None,
-                parsed_dict=None,
-                duration_seconds=0.0,
-                success=False,
-                error=str(e),
-            )
-
-    def generate_fix_retry(self, user_prompt: str) -> LLMCallResult[LLMFixResponse]:
-        """Step 3 retry: Generate a corrected fix SQL."""
-        try:
-            raw, duration = self._call_api(FIX_RETRY_SYSTEM_PROMPT, user_prompt)
-            data = self._parse_json(raw)
-            parsed = LLMFixResponse(**data)
-            return LLMCallResult(
-                parsed=parsed,
-                system_prompt=FIX_RETRY_SYSTEM_PROMPT,
-                user_prompt=user_prompt,
-                raw_response=raw,
-                parsed_dict=data,
-                duration_seconds=round(duration, 3),
-                success=True,
-            )
-        except Exception as e:
-            return LLMCallResult(
-                parsed=None,
-                system_prompt=FIX_RETRY_SYSTEM_PROMPT,
                 user_prompt=user_prompt,
                 raw_response=None,
                 parsed_dict=None,
