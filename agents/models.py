@@ -35,15 +35,23 @@ class ExplanationAgentStep(BaseModel):
     """One reasoning step produced by the ExplanationAgent LLM."""
 
     action: str = Field(
-        description="'ask_question' to gather more info, or 'done' to conclude"
+        description=(
+            "'run_query' to inspect the database directly, "
+            "'ask_question' to query the database owner, or "
+            "'done' to submit the final explanation"
+        )
+    )
+    sql: str | None = Field(
+        None,
+        description="SELECT query to run directly on the database (required when action='run_query')",
     )
     question: str | None = Field(
         None,
-        description="Question to ask the UserAgent (required when action='ask_question')",
+        description="Question to ask the database owner (required when action='ask_question')",
     )
     explanation: str | None = Field(
         None,
-        description="Full explanation of what happened to the data (required when action='done')",
+        description="Full explanation of what changed in the data (required when action='done')",
     )
     root_cause: str | None = Field(
         None,
@@ -51,19 +59,22 @@ class ExplanationAgentStep(BaseModel):
     )
 
 
-class AnswerAgentStep(BaseModel):
-    """One reasoning step produced by the AnswerAgent LLM."""
+class FixAgentStep(BaseModel):
+    """One reasoning step produced by the FixAgent LLM."""
 
     action: str = Field(
         description="'ask_question' to gather more info (incurs penalty), or 'done' to submit"
     )
     question: str | None = Field(
         None,
-        description="Question for the UserAgent (required when action='ask_question')",
+        description="Question for the database owner (required when action='ask_question')",
     )
-    predicted_altering_sql: str | None = Field(
+    fix_sql: str | None = Field(
         None,
-        description="The exact SQL DML that caused the alteration (required when action='done')",
+        description=(
+            "SQL statement(s) that will RESTORE the database to its original state "
+            "(required when action='done')"
+        ),
     )
     confidence: float | None = Field(
         None,
@@ -73,7 +84,7 @@ class AnswerAgentStep(BaseModel):
     )
     reasoning: str | None = Field(
         None,
-        description="Step-by-step reasoning behind the prediction (required when action='done')",
+        description="Step-by-step reasoning behind the fix (required when action='done')",
     )
 
 
@@ -81,11 +92,15 @@ class UserAgentStep(BaseModel):
     """One inner-loop decision step produced by the UserAgent LLM."""
 
     action: str = Field(
-        description="'run_query' to execute a SELECT, or 'respond' to give a final answer"
+        description=(
+            "'run_query_original' to query the original database, "
+            "'run_query_altered' to query the current (altered) database, "
+            "or 'respond' to give a final answer"
+        )
     )
     sql: str | None = Field(
         None,
-        description="SELECT query to run (required when action='run_query')",
+        description="SELECT query to run (required when action starts with 'run_query')",
     )
     answer: str | None = Field(
         None,
@@ -112,11 +127,11 @@ class ExplanationResult(BaseModel):
     conversation: list[ConversationTurn]
 
 
-class AnswerResult(BaseModel):
-    """Final output of the AnswerAgent for one dataset record."""
+class FixResult(BaseModel):
+    """Final output of the FixAgent for one dataset record."""
 
     record_id: int
-    predicted_altering_sql: str
+    fix_sql: str
     confidence: float
     reasoning: str
     questions_asked: int
@@ -126,18 +141,21 @@ class AnswerResult(BaseModel):
 # ── Evaluation ───────────────────────────────────────────────────────────────
 
 class EvaluationResult(BaseModel):
-    """Evaluation of the AnswerAgent's prediction against ground truth."""
+    """Evaluation of the FixAgent's output and the ExplanationAgent's explanation."""
 
     record_id: int
     db_id: str
-    ground_truth_sql: str
-    predicted_sql: str
-    exact_match: bool
-    semantic_match: bool
+    # Explanation quality (LLM-as-judge)
+    explanation_score: float        # 0.0–1.0 from judge LLM
+    explanation_reasoning: str      # judge's reasoning
+    # Fix correctness (DB comparison)
+    db_match: bool                  # True if fix_sql fully restores the database
+    db_diff: str                    # diff description when db_match is False
+    # Scoring
     questions_asked: int
-    question_penalty: float
-    base_score: float   # 1.0 if correct, 0.0 otherwise
-    final_score: float  # base_score − question_penalty × questions_asked
+    question_penalty: float         # total deduction (penalty × questions_asked)
+    base_score: float               # 1.0 if db_match, else 0.0
+    final_score: float              # base_score − question_penalty, clamped to [0, 1]
     error: str | None = None
 
 
@@ -147,5 +165,5 @@ class RunResult(BaseModel):
     record_id: int
     db_id: str
     explanation: ExplanationResult
-    answer: AnswerResult
+    fix: FixResult
     evaluation: EvaluationResult

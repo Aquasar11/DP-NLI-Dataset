@@ -129,3 +129,64 @@ def destroy_sandbox(sandbox_path: Path) -> None:
     if sandbox_path.exists():
         sandbox_path.unlink()
         logger.debug("Destroyed sandbox: %s", sandbox_path)
+
+
+def compare_databases(db_path1: Path, db_path2: Path) -> tuple[bool, str]:
+    """
+    Compare two SQLite databases for identical content across all tables.
+
+    Row comparison is order-insensitive — only set equality matters.
+
+    Args:
+        db_path1: Path to the first SQLite database (treated as reference).
+        db_path2: Path to the second SQLite database to compare against.
+
+    Returns:
+        ``(True, "")`` if every table has the same rows in both databases,
+        or ``(False, description)`` with a human-readable diff summary.
+    """
+
+    def _get_tables(conn: sqlite3.Connection) -> list[str]:
+        cursor = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+    def _get_rows(conn: sqlite3.Connection, table: str) -> frozenset[tuple]:
+        cursor = conn.execute(f'SELECT * FROM "{table}"')
+        return frozenset(tuple(row) for row in cursor.fetchall())
+
+    conn1 = sqlite3.connect(str(db_path1), timeout=30)
+    conn2 = sqlite3.connect(str(db_path2), timeout=30)
+    try:
+        tables1 = set(_get_tables(conn1))
+        tables2 = set(_get_tables(conn2))
+
+        if tables1 != tables2:
+            missing = tables1 - tables2
+            extra = tables2 - tables1
+            parts = []
+            if missing:
+                parts.append(f"tables missing from second db: {sorted(missing)}")
+            if extra:
+                parts.append(f"extra tables in second db: {sorted(extra)}")
+            return False, "; ".join(parts)
+
+        diffs: list[str] = []
+        for table in sorted(tables1):
+            rows1 = _get_rows(conn1, table)
+            rows2 = _get_rows(conn2, table)
+            if rows1 != rows2:
+                only_in_1 = rows1 - rows2
+                only_in_2 = rows2 - rows1
+                diffs.append(
+                    f"table '{table}': {len(only_in_1)} row(s) only in original, "
+                    f"{len(only_in_2)} row(s) only in candidate"
+                )
+
+        if diffs:
+            return False, "; ".join(diffs)
+        return True, ""
+    finally:
+        conn1.close()
+        conn2.close()

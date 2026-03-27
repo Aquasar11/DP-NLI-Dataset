@@ -2,12 +2,16 @@
 CLI entry point for the multi-agent data debugging framework.
 
 Loads the generated dataset, runs all three agents for each record, evaluates
-predictions, and writes results plus aggregate statistics to the output directory.
+results, and writes outputs plus aggregate statistics to the output directory.
 
 Usage:
     python main.py
     python main.py --provider gemini --use-vertexai --samples 10
     python main.py --dataset /path/to/dataset.json --db-dir /path/to/databases
+
+Per-agent overrides:
+    python main.py --user-agent-model gpt-4o --explanation-agent-model gpt-4o-mini \\
+                   --fix-agent-model gpt-4o --judge-model gpt-4o-mini
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 import config
+from config import AgentLLMConfig
 from llm_client import GeminiClient, LLMClient
 from models import DatasetRecord, RunResult
 from runner import run_record
@@ -34,70 +39,108 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # ── LLM settings ──────────────────────────────────────────────────────
-    parser.add_argument(
+    # ── Global LLM settings (fallback for all agents) ─────────────────────
+    global_group = parser.add_argument_group(
+        "Global LLM settings",
+        "Default settings for all agents. Per-agent flags override these.",
+    )
+    global_group.add_argument(
         "--provider",
         choices=["openai", "gemini"],
         default="openai",
-        help="LLM provider",
+        help="LLM provider (default for all agents)",
     )
-    parser.add_argument("--model", default=None, help="Model name override")
-    parser.add_argument("--api-key", default=None, help="API key override")
-    parser.add_argument(
-        "--base-url", default=None, help="OpenAI-compatible base URL (OpenAI only)"
+    global_group.add_argument("--model", default=None, help="Model name (default for all agents)")
+    global_group.add_argument("--api-key", default=None, help="API key (default for all agents)")
+    global_group.add_argument(
+        "--base-url", default=None, help="OpenAI-compatible base URL (default for all agents)"
     )
-    parser.add_argument(
+    global_group.add_argument(
         "--use-vertexai",
         action="store_true",
         default=False,
-        help="Route Gemini through Vertex AI",
+        help="Route Gemini through Vertex AI (default for all agents)",
     )
-    parser.add_argument("--temperature", type=float, default=None, help="LLM temperature")
+    global_group.add_argument(
+        "--temperature", type=float, default=None, help="LLM temperature (default for all agents)"
+    )
+
+    # ── Per-agent LLM overrides ───────────────────────────────────────────
+    def _add_agent_args(group_name: str, prefix: str, description: str) -> None:
+        group = parser.add_argument_group(group_name, description)
+        group.add_argument(f"--{prefix}-provider", choices=["openai", "gemini"], default=None)
+        group.add_argument(f"--{prefix}-model", default=None)
+        group.add_argument(f"--{prefix}-api-key", default=None)
+        group.add_argument(f"--{prefix}-base-url", default=None)
+        group.add_argument(f"--{prefix}-temperature", type=float, default=None)
+        group.add_argument(
+            f"--{prefix}-use-vertexai", action="store_true", default=None,
+            help=argparse.SUPPRESS,
+        )
+
+    _add_agent_args(
+        "UserAgent LLM", "user-agent",
+        "LLM settings for the oracle / database-owner agent",
+    )
+    _add_agent_args(
+        "ExplanationAgent LLM", "explanation-agent",
+        "LLM settings for the database investigation agent",
+    )
+    _add_agent_args(
+        "FixAgent LLM", "fix-agent",
+        "LLM settings for the database repair agent",
+    )
+    _add_agent_args(
+        "Judge LLM", "judge",
+        "LLM settings for the explanation quality judge (defaults to UserAgent settings)",
+    )
 
     # ── Pipeline settings ─────────────────────────────────────────────────
-    parser.add_argument(
+    pipeline_group = parser.add_argument_group("Pipeline settings")
+    pipeline_group.add_argument(
         "--samples",
         type=int,
         default=0,
         help="Number of records to process (0 = all)",
     )
-    parser.add_argument(
+    pipeline_group.add_argument(
         "--workers",
         type=int,
         default=1,
         help="Number of parallel workers",
     )
-    parser.add_argument(
+    pipeline_group.add_argument(
         "--max-explanation-turns",
         type=int,
         default=config.MAX_EXPLANATION_TURNS,
-        help="Max Q&A turns for the ExplanationAgent",
+        help="Max turns for the ExplanationAgent",
     )
-    parser.add_argument(
-        "--max-answer-turns",
+    pipeline_group.add_argument(
+        "--max-fix-turns",
         type=int,
-        default=config.MAX_ANSWER_TURNS,
-        help="Max Q&A turns for the AnswerAgent",
+        default=config.MAX_FIX_TURNS,
+        help="Max turns for the FixAgent",
     )
-    parser.add_argument(
+    pipeline_group.add_argument(
         "--question-penalty",
         type=float,
         default=config.QUESTION_PENALTY,
-        help="Score penalty per question asked by the AnswerAgent",
+        help="Score penalty per question asked by the FixAgent",
     )
 
     # ── Paths ─────────────────────────────────────────────────────────────
-    parser.add_argument(
+    path_group = parser.add_argument_group("Paths")
+    path_group.add_argument(
         "--dataset",
         default=str(config.DATASET_PATH),
         help="Path to dataset.json produced by the generation pipeline",
     )
-    parser.add_argument(
+    path_group.add_argument(
         "--db-dir",
         default=str(config.DB_BASE_DIR),
         help="Root directory containing per-database SQLite folders",
     )
-    parser.add_argument(
+    path_group.add_argument(
         "--output-dir",
         default=str(config.OUTPUT_DIR),
         help="Directory for results and statistics",
@@ -123,23 +166,56 @@ def setup_logging(level: str) -> None:
     )
 
 
-def _build_llm(args: argparse.Namespace) -> LLMClient | GeminiClient:
-    if args.provider == "gemini":
-        return GeminiClient(
-            api_key=args.api_key,
-            model=args.model,
-            temperature=args.temperature,
-            use_vertexai=args.use_vertexai or None,
-        )
-    return LLMClient(
-        api_key=args.api_key,
-        model=args.model,
-        base_url=args.base_url,
-        temperature=args.temperature,
+def _resolve_agent_config(
+    args: argparse.Namespace,
+    prefix: str,  # e.g. "user_agent", "explanation_agent"
+    fallback: AgentLLMConfig,
+) -> AgentLLMConfig:
+    """
+    Build an AgentLLMConfig for one agent by layering:
+      CLI per-agent flags → CLI global flags → env-var fallback config
+    """
+    prefix_arg = prefix.replace("_", "-")  # for hyphenated argparse names
+
+    def _get(attr: str):
+        # Try per-agent CLI flag first, then return None
+        return getattr(args, f"{prefix}_{attr}", None)
+
+    provider = _get("provider") or fallback.provider
+    api_key = _get("api_key") or fallback.api_key
+    model = _get("model") or fallback.model
+    base_url = _get("base_url") or fallback.base_url
+    temperature = _get("temperature") if _get("temperature") is not None else fallback.temperature
+    use_vertexai = _get("use_vertexai") if _get("use_vertexai") is not None else fallback.use_vertexai
+
+    return AgentLLMConfig(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        base_url=base_url,
+        temperature=temperature,
+        use_vertexai=use_vertexai,
     )
 
 
-def _save_results(results: list[RunResult], output_dir: Path) -> None:
+def _build_llm(agent_config: AgentLLMConfig) -> LLMClient | GeminiClient:
+    """Construct an LLM client from an AgentLLMConfig."""
+    if agent_config.provider == "gemini":
+        return GeminiClient(
+            api_key=agent_config.api_key or None,
+            model=agent_config.model or None,
+            temperature=agent_config.temperature,
+            use_vertexai=agent_config.use_vertexai or None,
+        )
+    return LLMClient(
+        api_key=agent_config.api_key or None,
+        model=agent_config.model or None,
+        base_url=agent_config.base_url or None,
+        temperature=agent_config.temperature,
+    )
+
+
+def _save_results(results: list[RunResult], output_dir: Path) -> tuple[dict, Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     results_path = output_dir / "results.json"
@@ -153,21 +229,17 @@ def _save_results(results: list[RunResult], output_dir: Path) -> None:
     evals = [r.evaluation for r in results]
     n = len(evals)
     if n:
-        exact = sum(e.exact_match for e in evals)
-        semantic = sum(e.semantic_match for e in evals)
-        correct = sum(e.exact_match or e.semantic_match for e in evals)
-        avg_score = sum(e.final_score for e in evals) / n
+        db_match_count = sum(e.db_match for e in evals)
+        avg_explanation_score = sum(e.explanation_score for e in evals) / n
+        avg_final_score = sum(e.final_score for e in evals) / n
         avg_questions = sum(e.questions_asked for e in evals) / n
 
         stats = {
             "total_records": n,
-            "exact_match": exact,
-            "semantic_match": semantic,
-            "correct_total": correct,
-            "exact_match_rate": f"{exact / n * 100:.1f}%",
-            "semantic_match_rate": f"{semantic / n * 100:.1f}%",
-            "accuracy": f"{correct / n * 100:.1f}%",
-            "avg_final_score": round(avg_score, 4),
+            "db_match_count": db_match_count,
+            "db_match_rate": f"{db_match_count / n * 100:.1f}%",
+            "avg_explanation_score": round(avg_explanation_score, 4),
+            "avg_final_score": round(avg_final_score, 4),
             "avg_questions_asked": round(avg_questions, 2),
         }
     else:
@@ -203,11 +275,61 @@ def main() -> None:
         records = records[: args.samples]
     logger.info("Loaded %d record(s) from %s", len(records), dataset_path)
 
-    # ── Build LLM client ──────────────────────────────────────────────────
-    llm = _build_llm(args)
-    logger.info("Provider: %s  model: %s", args.provider, llm.model)
-    logger.info("Workers: %d  explanation_turns: %d  answer_turns: %d",
-                args.workers, args.max_explanation_turns, args.max_answer_turns)
+    # ── Build per-agent LLM clients ───────────────────────────────────────
+    # Global fallback config from CLI global flags + env vars
+    global_fallback = AgentLLMConfig(
+        provider=args.provider,
+        api_key=args.api_key or "",
+        model=args.model or "",
+        base_url=args.base_url,
+        temperature=args.temperature if args.temperature is not None else 0.3,
+        use_vertexai=args.use_vertexai,
+    )
+    # Merge: env-var per-agent config takes precedence over global env vars,
+    # but CLI per-agent flags take precedence over everything.
+    user_cfg = _resolve_agent_config(args, "user_agent", config.USER_AGENT_CONFIG)
+    explanation_cfg = _resolve_agent_config(args, "explanation_agent", config.EXPLANATION_AGENT_CONFIG)
+    fix_cfg = _resolve_agent_config(args, "fix_agent", config.FIX_AGENT_CONFIG)
+    # Judge falls back to user_agent config (not global)
+    judge_cfg = _resolve_agent_config(args, "judge", config.JUDGE_CONFIG)
+
+    # Apply CLI global overrides to any config that still has empty values
+    def _apply_global(cfg: AgentLLMConfig) -> AgentLLMConfig:
+        return AgentLLMConfig(
+            provider=cfg.provider or global_fallback.provider,
+            api_key=cfg.api_key or global_fallback.api_key,
+            model=cfg.model or global_fallback.model,
+            base_url=cfg.base_url or global_fallback.base_url,
+            temperature=cfg.temperature,
+            use_vertexai=cfg.use_vertexai or global_fallback.use_vertexai,
+        )
+
+    user_cfg = _apply_global(user_cfg)
+    explanation_cfg = _apply_global(explanation_cfg)
+    fix_cfg = _apply_global(fix_cfg)
+    judge_cfg = _apply_global(judge_cfg)
+
+    user_llm = _build_llm(user_cfg)
+    explanation_llm = _build_llm(explanation_cfg)
+    fix_llm = _build_llm(fix_cfg)
+    judge_llm = _build_llm(judge_cfg)
+
+    logger.info(
+        "UserAgent:       provider=%s  model=%s", user_cfg.provider, user_llm.model
+    )
+    logger.info(
+        "ExplanationAgent: provider=%s  model=%s", explanation_cfg.provider, explanation_llm.model
+    )
+    logger.info(
+        "FixAgent:        provider=%s  model=%s", fix_cfg.provider, fix_llm.model
+    )
+    logger.info(
+        "Judge:           provider=%s  model=%s", judge_cfg.provider, judge_llm.model
+    )
+    logger.info(
+        "Workers: %d  explanation_turns: %d  fix_turns: %d",
+        args.workers, args.max_explanation_turns, args.max_fix_turns,
+    )
     logger.info("-" * 60)
 
     db_base_dir = Path(args.db_dir)
@@ -223,11 +345,14 @@ def main() -> None:
         try:
             return run_record(
                 record=record,
-                llm=llm,
+                user_llm=user_llm,
+                explanation_llm=explanation_llm,
+                fix_llm=fix_llm,
+                judge_llm=judge_llm,
                 db_base_dir=db_base_dir,
                 sandbox_dir=sandbox_dir,
                 max_explanation_turns=args.max_explanation_turns,
-                max_answer_turns=args.max_answer_turns,
+                max_fix_turns=args.max_fix_turns,
                 question_penalty=args.question_penalty,
             )
         except Exception as exc:
@@ -251,11 +376,10 @@ def main() -> None:
 
     logger.info("=" * 60)
     logger.info("DONE in %.1fs — %d/%d records processed", elapsed, len(results), len(records))
-    logger.info("Accuracy:          %s", stats.get("accuracy", "N/A"))
-    logger.info("Exact match:       %s", stats.get("exact_match_rate", "N/A"))
-    logger.info("Semantic match:    %s", stats.get("semantic_match_rate", "N/A"))
-    logger.info("Avg final score:   %s", stats.get("avg_final_score", "N/A"))
-    logger.info("Avg questions:     %s", stats.get("avg_questions_asked", "N/A"))
+    logger.info("DB match rate:          %s", stats.get("db_match_rate", "N/A"))
+    logger.info("Avg explanation score:  %s", stats.get("avg_explanation_score", "N/A"))
+    logger.info("Avg final score:        %s", stats.get("avg_final_score", "N/A"))
+    logger.info("Avg questions asked:    %s", stats.get("avg_questions_asked", "N/A"))
     if errors:
         logger.warning("Failed records: %s", ", ".join(errors))
     logger.info("Results: %s", results_path)

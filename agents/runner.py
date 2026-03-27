@@ -3,9 +3,9 @@ Runner — orchestrates the three-agent pipeline for a single dataset record.
 
 Flow for each record:
   1. Initialize UserAgent (creates altered sandbox database).
-  2. ExplanationAgent investigates via Q&A with UserAgent.
-  3. AnswerAgent receives the explanation and predicts the DML SQL.
-  4. Evaluator scores the AnswerAgent's prediction.
+  2. ExplanationAgent investigates via direct DB queries and Q&A with UserAgent.
+  3. FixAgent receives the explanation and generates SQL to restore the database.
+  4. Evaluator judges the explanation (LLM-as-judge) and the fix (DB comparison).
   5. UserAgent sandbox is cleaned up.
 """
 
@@ -16,10 +16,10 @@ import time
 from pathlib import Path
 from typing import Union
 
-from answer_agent import AnswerAgent
 from database_utils import get_db_path
 from evaluator import evaluate
 from explanation_agent import ExplanationAgent
+from fix_agent import FixAgent
 from llm_client import GeminiClient, LLMClient
 from models import DatasetRecord, RunResult
 from user_agent import UserAgent
@@ -31,11 +31,14 @@ logger = logging.getLogger(__name__)
 
 def run_record(
     record: DatasetRecord,
-    llm: Union[LLMClient, GeminiClient],
+    user_llm: Union[LLMClient, GeminiClient],
+    explanation_llm: Union[LLMClient, GeminiClient],
+    fix_llm: Union[LLMClient, GeminiClient],
+    judge_llm: Union[LLMClient, GeminiClient],
     db_base_dir: Path | None = None,
     sandbox_dir: Path | None = None,
     max_explanation_turns: int | None = None,
-    max_answer_turns: int | None = None,
+    max_fix_turns: int | None = None,
     question_penalty: float | None = None,
 ) -> RunResult:
     """
@@ -43,15 +46,18 @@ def run_record(
 
     Args:
         record: The dataset record to process.
-        llm: Shared LLM client instance (thread-safe; each agent call is independent).
+        user_llm: LLM client for the UserAgent.
+        explanation_llm: LLM client for the ExplanationAgent.
+        fix_llm: LLM client for the FixAgent.
+        judge_llm: LLM client for the explanation judge.
         db_base_dir: Override for directory containing database files.
         sandbox_dir: Override for sandbox directory.
         max_explanation_turns: Override for ExplanationAgent turn limit.
-        max_answer_turns: Override for AnswerAgent turn limit.
+        max_fix_turns: Override for FixAgent turn limit.
         question_penalty: Override for per-question score penalty.
 
     Returns:
-        :class:`RunResult` with explanation, answer, and evaluation.
+        :class:`RunResult` with explanation, fix, and evaluation.
     """
     t_start = time.perf_counter()
     logger.info(
@@ -68,7 +74,7 @@ def run_record(
 
     user_agent = UserAgent(
         record=record,
-        llm=llm,
+        llm=user_llm,
         db_base_dir=db_base_dir,
         sandbox_dir=sandbox_dir,
     )
@@ -77,7 +83,8 @@ def run_record(
         # ── Step 1: ExplanationAgent ─────────────────────────────────────────
         explanation_agent = ExplanationAgent(
             record=record,
-            llm=llm,
+            llm=explanation_llm,
+            altered_db_path=user_agent.sandbox_path,
             max_turns=max_explanation_turns,
         )
         explanation = explanation_agent.run(user_agent)
@@ -86,25 +93,26 @@ def run_record(
             explanation.turns_used, explanation.root_cause,
         )
 
-        # ── Step 2: AnswerAgent ───────────────────────────────────────────────
-        answer_agent = AnswerAgent(
+        # ── Step 2: FixAgent ──────────────────────────────────────────────────
+        fix_agent = FixAgent(
             record=record,
             explanation=explanation,
-            llm=llm,
-            max_turns=max_answer_turns,
+            llm=fix_llm,
+            max_turns=max_fix_turns,
             question_penalty=question_penalty,
         )
-        answer = answer_agent.run(user_agent)
+        fix = fix_agent.run(user_agent)
         logger.info(
-            "AnswerAgent done  questions_asked=%d  confidence=%.2f  "
-            "predicted_sql=%s",
-            answer.questions_asked, answer.confidence, answer.predicted_altering_sql,
+            "FixAgent done  questions_asked=%d  confidence=%.2f  fix_sql=%s",
+            fix.questions_asked, fix.confidence, fix.fix_sql,
         )
 
         # ── Step 3: Evaluator ─────────────────────────────────────────────────
         evaluation = evaluate(
             record=record,
-            answer=answer,
+            fix_result=fix,
+            explanation_result=explanation,
+            judge_llm=judge_llm,
             question_penalty=question_penalty,
             sandbox_dir=sandbox_dir,
             db_base_dir=db_base_dir,
@@ -115,15 +123,15 @@ def run_record(
 
     elapsed = round(time.perf_counter() - t_start, 2)
     logger.info(
-        "Record id=%d done in %.1fs — exact=%s  semantic=%s  final_score=%.4f",
+        "Record id=%d done in %.1fs — db_match=%s  explanation_score=%.2f  final_score=%.4f",
         record.id, elapsed,
-        evaluation.exact_match, evaluation.semantic_match, evaluation.final_score,
+        evaluation.db_match, evaluation.explanation_score, evaluation.final_score,
     )
 
     return RunResult(
         record_id=record.id,
         db_id=record.db_id,
         explanation=explanation,
-        answer=answer,
+        fix=fix,
         evaluation=evaluation,
     )

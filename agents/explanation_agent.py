@@ -1,17 +1,22 @@
 """
-ExplanationAgent — investigates and explains the database alteration.
+ExplanationAgent — independently investigates and explains the database alteration.
 
-Receives the follow-up question, gold SQL, and current (altered) result, then
-conducts a structured Q&A with the UserAgent to identify what changed in the
-database and why it caused the unexpected query result.
+The agent can:
+  1. Run SELECT queries directly on the altered database (run_query tool).
+  2. Ask the UserAgent targeted questions when DB inspection isn't enough.
+
+The goal is to identify WHAT changed in the database without being told —
+it must discover the issue on its own through investigation.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Union
 
+from database_utils import run_select_query
 from llm_client import GeminiClient, LLMClient
 from models import (
     ConversationTurn,
@@ -29,10 +34,10 @@ logger = logging.getLogger(__name__)
 
 class ExplanationAgent:
     """
-    Investigates a data anomaly by questioning the UserAgent and produces
-    a human-readable explanation of the root cause.
+    Investigates a data anomaly and produces a human-readable explanation.
 
-    The agent uses a structured action loop:
+    The agent uses a structured action loop with three possible actions:
+      - ``run_query``: execute a SELECT directly on the altered database.
       - ``ask_question``: submit a targeted question to the UserAgent.
       - ``done``: conclude with a full explanation and root-cause statement.
     """
@@ -41,12 +46,15 @@ class ExplanationAgent:
         self,
         record: DatasetRecord,
         llm: Union[LLMClient, GeminiClient],
+        altered_db_path: Path,
         max_turns: int | None = None,
     ) -> None:
         self._record = record
         self._llm = llm
+        self._altered_db_path = altered_db_path
         self._max_turns = max_turns if max_turns is not None else config.MAX_EXPLANATION_TURNS
 
+        ddl = self._get_ddl()
         self._system_prompt = EXPLANATION_AGENT_SYSTEM_PROMPT.format_map(
             {
                 "db_id": record.db_id,
@@ -56,8 +64,18 @@ class ExplanationAgent:
                 "gold_result": json.dumps(record.gold_result, default=str),
                 "altered_result": json.dumps(record.altered_result, default=str),
                 "follow_up_question": record.follow_up_question,
+                "ddl": ddl,
             }
         )
+
+    def _get_ddl(self) -> str:
+        """Extract DDL from the altered database for context."""
+        from database_utils import get_ddl
+        try:
+            return get_ddl(self._altered_db_path)
+        except Exception as exc:
+            logger.warning("[ExplanationAgent] could not read DDL: %s", exc)
+            return "(schema unavailable)"
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -66,7 +84,7 @@ class ExplanationAgent:
         Run the explanation investigation loop.
 
         Args:
-            user_agent: The oracle agent to direct questions to.
+            user_agent: The oracle agent to direct questions to when needed.
 
         Returns:
             :class:`ExplanationResult` with the full explanation and conversation log.
@@ -99,7 +117,30 @@ class ExplanationAgent:
                 logger.warning("[ExplanationAgent] could not parse step: %s — raw: %s", exc, data)
                 break
 
-            if step.action == "ask_question" and step.question:
+            if step.action == "run_query" and step.sql:
+                turns_used += 1
+                sql = step.sql.strip()
+                # Only the first statement to avoid multi-statement injection
+                first_stmt = next((s.strip() for s in sql.split(";") if s.strip()), sql)
+                logger.info("[ExplanationAgent] running query (turn %d): %s", turn, first_stmt)
+
+                try:
+                    rows = run_select_query(self._altered_db_path, first_stmt)
+                    tool_result = (
+                        f"Query succeeded ({len(rows)} row(s)): "
+                        + json.dumps(rows[:20], default=str)
+                    )
+                except Exception as exc:
+                    tool_result = f"Query failed: {exc}"
+                    logger.warning("[ExplanationAgent] query error: %s", exc)
+
+                agent_messages.append({"role": "assistant", "content": json.dumps(data)})
+                agent_messages.append({
+                    "role": "user",
+                    "content": f"Query result: {tool_result}",
+                })
+
+            elif step.action == "ask_question" and step.question:
                 turns_used += 1
                 question = step.question.strip()
                 logger.info("[ExplanationAgent] asking (turn %d): %s", turn, question)
@@ -110,7 +151,6 @@ class ExplanationAgent:
                 conversation.append(ConversationTurn(role="investigator", content=question))
                 conversation.append(ConversationTurn(role="user", content=answer))
 
-                # Feed the Q&A back to the agent's own context
                 agent_messages.append({"role": "assistant", "content": json.dumps(data)})
                 agent_messages.append({
                     "role": "user",
@@ -152,14 +192,13 @@ class ExplanationAgent:
             "[ExplanationAgent] max turns (%d) reached without conclusion for record=%d",
             self._max_turns, self._record.id,
         )
-        fallback_explanation = (
-            "Based on the investigation, the query results changed because some "
-            "records that previously satisfied the query conditions were modified "
-            "or removed from the database."
-        )
         return ExplanationResult(
             record_id=self._record.id,
-            explanation=fallback_explanation,
+            explanation=(
+                "Based on the investigation, the query results changed because some "
+                "records that previously satisfied the query conditions were modified "
+                "or removed from the database."
+            ),
             root_cause="Data modification caused relevant records to become unavailable.",
             turns_used=turns_used,
             conversation=conversation,
