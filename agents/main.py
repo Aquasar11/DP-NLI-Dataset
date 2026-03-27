@@ -168,25 +168,44 @@ def setup_logging(level: str) -> None:
 
 def _resolve_agent_config(
     args: argparse.Namespace,
-    prefix: str,  # e.g. "user_agent", "explanation_agent"
-    fallback: AgentLLMConfig,
+    prefix: str,
+    global_fallback: AgentLLMConfig,
+    env_config: AgentLLMConfig,
 ) -> AgentLLMConfig:
     """
-    Build an AgentLLMConfig for one agent by layering:
-      CLI per-agent flags → CLI global flags → env-var fallback config
+    Build an AgentLLMConfig with 3-level priority:
+      1. Per-agent CLI flag  (highest)
+      2. Global CLI flag
+      3. Env-var agent config  (lowest)
     """
-    prefix_arg = prefix.replace("_", "-")  # for hyphenated argparse names
-
     def _get(attr: str):
-        # Try per-agent CLI flag first, then return None
         return getattr(args, f"{prefix}_{attr}", None)
 
-    provider = _get("provider") or fallback.provider
-    api_key = _get("api_key") or fallback.api_key
-    model = _get("model") or fallback.model
-    base_url = _get("base_url") or fallback.base_url
-    temperature = _get("temperature") if _get("temperature") is not None else fallback.temperature
-    use_vertexai = _get("use_vertexai") if _get("use_vertexai") is not None else fallback.use_vertexai
+    provider = _get("provider") or global_fallback.provider or env_config.provider
+    api_key = _get("api_key") or global_fallback.api_key or env_config.api_key
+    base_url = _get("base_url") or global_fallback.base_url or env_config.base_url
+
+    # Only inherit env_config.model when it belongs to the *same* provider;
+    # otherwise fall back to the provider-appropriate default.
+    explicit_model = _get("model") or global_fallback.model
+    if explicit_model:
+        model = explicit_model
+    elif env_config.provider == provider:
+        model = env_config.model or (
+            config.GEMINI_MODEL if provider == "gemini" else config.OPENAI_MODEL
+        )
+    else:
+        model = config.GEMINI_MODEL if provider == "gemini" else config.OPENAI_MODEL
+    temperature = (
+        _get("temperature")
+        if _get("temperature") is not None
+        else global_fallback.temperature
+    )
+    use_vertexai = (
+        _get("use_vertexai")
+        if _get("use_vertexai") is not None
+        else (global_fallback.use_vertexai or env_config.use_vertexai)
+    )
 
     return AgentLLMConfig(
         provider=provider,
@@ -285,29 +304,12 @@ def main() -> None:
         temperature=args.temperature if args.temperature is not None else 0.3,
         use_vertexai=args.use_vertexai,
     )
-    # Merge: env-var per-agent config takes precedence over global env vars,
-    # but CLI per-agent flags take precedence over everything.
-    user_cfg = _resolve_agent_config(args, "user_agent", config.USER_AGENT_CONFIG)
-    explanation_cfg = _resolve_agent_config(args, "explanation_agent", config.EXPLANATION_AGENT_CONFIG)
-    fix_cfg = _resolve_agent_config(args, "fix_agent", config.FIX_AGENT_CONFIG)
-    # Judge falls back to user_agent config (not global)
-    judge_cfg = _resolve_agent_config(args, "judge", config.JUDGE_CONFIG)
-
-    # Apply CLI global overrides to any config that still has empty values
-    def _apply_global(cfg: AgentLLMConfig) -> AgentLLMConfig:
-        return AgentLLMConfig(
-            provider=cfg.provider or global_fallback.provider,
-            api_key=cfg.api_key or global_fallback.api_key,
-            model=cfg.model or global_fallback.model,
-            base_url=cfg.base_url or global_fallback.base_url,
-            temperature=cfg.temperature,
-            use_vertexai=cfg.use_vertexai or global_fallback.use_vertexai,
-        )
-
-    user_cfg = _apply_global(user_cfg)
-    explanation_cfg = _apply_global(explanation_cfg)
-    fix_cfg = _apply_global(fix_cfg)
-    judge_cfg = _apply_global(judge_cfg)
+    # Merge: per-agent CLI → global CLI → env-var per-agent config
+    user_cfg = _resolve_agent_config(args, "user_agent", global_fallback, config.USER_AGENT_CONFIG)
+    explanation_cfg = _resolve_agent_config(args, "explanation_agent", global_fallback, config.EXPLANATION_AGENT_CONFIG)
+    fix_cfg = _resolve_agent_config(args, "fix_agent", global_fallback, config.FIX_AGENT_CONFIG)
+    # Judge falls back to user_agent env config (not global)
+    judge_cfg = _resolve_agent_config(args, "judge", global_fallback, config.JUDGE_CONFIG)
 
     user_llm = _build_llm(user_cfg)
     explanation_llm = _build_llm(explanation_cfg)
