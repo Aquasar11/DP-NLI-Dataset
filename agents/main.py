@@ -248,18 +248,27 @@ def _save_results(results: list[RunResult], output_dir: Path) -> tuple[dict, Pat
     evals = [r.evaluation for r in results]
     n = len(evals)
     if n:
-        db_match_count = sum(e.db_match for e in evals)
+        avg_fix_score = sum(e.fix_score for e in evals) / n
         avg_explanation_score = sum(e.explanation_score for e in evals) / n
         avg_final_score = sum(e.final_score for e in evals) / n
         avg_questions = sum(e.questions_asked for e in evals) / n
 
         stats = {
             "total_records": n,
-            "db_match_count": db_match_count,
-            "db_match_rate": f"{db_match_count / n * 100:.1f}%",
+            "avg_fix_score": round(avg_fix_score, 4),
             "avg_explanation_score": round(avg_explanation_score, 4),
             "avg_final_score": round(avg_final_score, 4),
             "avg_questions_asked": round(avg_questions, 2),
+            "explanation_score_distribution": {
+                "score_0.0": sum(1 for e in evals if e.explanation_score == 0.0),
+                "score_0.5": sum(1 for e in evals if e.explanation_score == 0.5),
+                "score_1.0": sum(1 for e in evals if e.explanation_score == 1.0),
+            },
+            "fix_score_distribution": {
+                "score_0.0": sum(1 for e in evals if e.fix_score == 0.0),
+                "score_1.0": sum(1 for e in evals if e.fix_score == 1.0),
+                "score_1.5": sum(1 for e in evals if e.fix_score == 1.5),
+            },
         }
     else:
         stats = {"total_records": 0}
@@ -378,7 +387,7 @@ def main() -> None:
 
     logger.info("=" * 60)
     logger.info("DONE in %.1fs — %d/%d records processed", elapsed, len(results), len(records))
-    logger.info("DB match rate:          %s", stats.get("db_match_rate", "N/A"))
+    logger.info("Avg fix score:          %s", stats.get("avg_fix_score", "N/A"))
     logger.info("Avg explanation score:  %s", stats.get("avg_explanation_score", "N/A"))
     logger.info("Avg final score:        %s", stats.get("avg_final_score", "N/A"))
     logger.info("Avg questions asked:    %s", stats.get("avg_questions_asked", "N/A"))

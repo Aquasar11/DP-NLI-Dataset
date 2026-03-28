@@ -10,13 +10,13 @@ The framework models a real-world scenario in which a database query that previo
 
 | Agent | Role | Input | Output |
 |---|---|---|---|
-| **UserAgent** | Database owner / oracle | Full alteration context; access to both original and altered DBs | Answers questions; runs SQL on either database |
-| **ExplanationAgent** | Investigator | `follow_up_question`, `gold_sql`, `altered_result`, schema | Explanation + root cause (discovered independently) |
+| **UserAgent** | Database owner / oracle | Full alteration context; pre-computed DB diff (no SQL access) | Answers questions based on provided diff text |
+| **ExplanationAgent** | Investigator | `follow_up_question`, `gold_sql`, `altered_result`, schema | Explanation + root cause (discovered autonomously via DB queries) |
 | **FixAgent** | Repair engineer | Explanation from `ExplanationAgent` | SQL to restore the database to its original state |
 
 An **Evaluator** then:
-- Uses an **LLM judge** to score the `ExplanationAgent`'s explanation against the ground truth.
-- Applies the `FixAgent`'s SQL to a sandbox and **compares the result database to the original** to verify the fix is complete.
+- Uses an **LLM judge** to score the `ExplanationAgent`'s explanation against the ground truth (3-level: 0.0 / 0.5 / 1.0).
+- Applies the `FixAgent`'s SQL and checks whether `gold_sql` returns `gold_result` without corrupting other records. A bonus is awarded for fully restoring corrupted rows.
 
 ---
 
@@ -24,57 +24,60 @@ An **Evaluator** then:
 
 ```
 DatasetRecord
-      │
-      ▼
-┌─────────────┐   creates altered sandbox + diffs vs original
-│  UserAgent  │◄──────────────────────────────────────────────┐
-│  (oracle)   │   has access to BOTH original & altered DBs   │
-└──────┬──────┘                                               │
-       │ responds to targeted questions only                   │
-       │                                                       │
-       ▼                                                       │
-┌──────────────────┐  run_query (direct DB) / ask_question / done
-│ ExplanationAgent │──────────────────────────► ExplanationResult
-│  (investigator)  │                            (explanation + root_cause)
-└──────────────────┘                                          │
-                                                              │
-       ┌──────────────────────────────────────────────────────┘
-       │ explanation + root_cause passed in
-       ▼
-┌──────────┐  ask_question (penalized) / done
-│ FixAgent │──────────────────────────────────► FixResult
-│ (repair) │                                    (fix_sql to restore DB)
-└──────────┘
-       │
-       ▼
-┌───────────┐
-│ Evaluator │──► EvaluationResult
-└───────────┘    (explanation_score, db_match, final_score)
+      |
+      v
+runner.py creates altered sandbox + computes structured DB diff
+      |
+      |--- diff_text (formatted table of row-level changes)
+      |        |
+      |        v
+      |  +-----------+
+      |  | UserAgent |   receives diff as text input (NO SQL access)
+      |  |  (oracle) |   answers questions from FixAgent only
+      |  +-----+-----+
+      |        |
+      |--- sandbox_path (altered DB)
+      |        |
+      |        v
+      |  +------------------+   run_query (direct DB) / done
+      |  | ExplanationAgent |------------------------------> ExplanationResult
+      |  |  (autonomous)    |                                (explanation + root_cause)
+      |  +------------------+
+      |                                                       |
+      +--- explanation passed to FixAgent                     |
+               |                                              |
+               v                                              |
+         +----------+  ask_question (penalized) / done        |
+         | FixAgent |-----------------------------------> FixResult
+         | (repair) |                                     (fix_sql)
+         +----------+
+               |
+               v
+         +-----------+
+         | Evaluator |---> EvaluationResult
+         +-----------+     (explanation_score, fix_score, final_score)
 ```
+
+### Key Design Decisions
+
+- **ExplanationAgent is fully autonomous**: It has direct `run_query` access to the altered database and does NOT interact with the UserAgent. It must discover the root cause independently through SQL inspection.
+- **UserAgent has NO SQL access**: It receives a pre-computed structured diff (original vs. altered records) as formatted text. It answers questions solely from this context.
+- **FixAgent interacts with UserAgent**: It can ask clarifying questions (e.g. "what were the original column values?"), but each question incurs a score penalty.
+- **Fallback detection**: When an agent fails to produce a real LLM response (timeout, max turns, empty output), the result is marked `is_fallback=True` and automatically scored 0 — the judge is skipped entirely.
 
 ### Agent Interaction Protocol
 
 All agents communicate via structured JSON responses.
 
-**UserAgent** (inner ReAct tool-use loop):
+**UserAgent** (single LLM call, no tools):
 ```json
-// Query the original (pre-alteration) database:
-{"action": "run_query_original", "sql": "SELECT ...", "reasoning": "..."}
-
-// Query the current (altered) database:
-{"action": "run_query_altered", "sql": "SELECT ...", "reasoning": "..."}
-
-// Give a final answer:
-{"action": "respond", "answer": "..."}
+{"answer": "The row with id=42 no longer exists in the current database."}
 ```
 
-**ExplanationAgent** (investigation loop — three possible actions):
+**ExplanationAgent** (autonomous investigation loop — two actions):
 ```json
 // Run a SELECT directly on the altered database:
 {"action": "run_query", "sql": "SELECT ..."}
-
-// Ask the database owner a question:
-{"action": "ask_question", "question": "..."}
 
 // Conclude with an explanation:
 {"action": "done", "explanation": "...", "root_cause": "..."}
@@ -96,16 +99,16 @@ All agents communicate via structured JSON responses.
 ```
 agents/
 ├── main.py              # CLI entry point
-├── runner.py            # Per-record orchestration of the three-agent pipeline
+├── runner.py            # Per-record orchestration (sandbox, diff, agents, eval)
 ├── config.py            # Configuration (env vars, per-agent configs, paths)
 ├── models.py            # Pydantic data models
 ├── llm_client.py        # LLM client wrappers (OpenAI + Gemini)
 ├── prompts.py           # System prompt templates for all agents + judge
-├── user_agent.py        # UserAgent implementation
-├── explanation_agent.py # ExplanationAgent implementation
+├── user_agent.py        # UserAgent (text-based oracle, no SQL)
+├── explanation_agent.py # ExplanationAgent (autonomous, run_query only)
 ├── fix_agent.py         # FixAgent implementation
-├── database_utils.py    # SQLite utilities (sandbox, query execution, DB comparison)
-├── evaluator.py         # Scoring: LLM judge + database comparison
+├── database_utils.py    # SQLite utilities (sandbox, query, DB comparison, structured diff)
+├── evaluator.py         # Scoring: LLM judge + relaxed fix evaluation
 ├── requirements.txt     # Python dependencies
 └── output/              # Generated at runtime
     ├── results.json     # Full RunResult for every processed record
@@ -144,18 +147,38 @@ The framework consumes `dataset.json` produced by the `data_debugging_scenario` 
 
 ### Fix Score
 
-```
-base_score  = 1.0  if db_match else 0.0
-final_score = max(0.0, base_score − question_penalty × questions_asked)
-```
+The fix evaluation uses a **relaxed** approach — the goal is to restore the expected query result without corrupting other records, not necessarily to achieve an exact full-database match.
 
-**`db_match`** — After the `FixAgent`'s `fix_sql` is applied to a fresh copy of the altered database, every table in the result is compared row-by-row (order-insensitive) against the original database. `db_match` is `True` only if all tables are identical.
+| `fix_score` | Meaning |
+|---|---|
+| **0.0** | `gold_sql` does not return `gold_result` after fix, OR previously-good records were corrupted |
+| **1.0** | `gold_sql` returns `gold_result` AND no previously-good records were corrupted |
+| **1.5** | Additionally, all corrupted rows are fully restored to their original values (exact DB match) |
+
+```
+final_score = max(0.0, fix_score - question_penalty * questions_asked)
+```
 
 **Question penalty** — every question the `FixAgent` asks costs `question_penalty` (default `0.05`) from the final score. The agent is incentivized to reason from the `ExplanationAgent`'s output before asking questions.
 
-### Explanation Score
+### Explanation Score (LLM-as-Judge)
 
-The `ExplanationAgent`'s explanation is scored by a separate **judge LLM** (0.0–1.0) that compares it against the ground-truth alteration information. The judge evaluates whether the correct table, change type, and affected rows were identified.
+The `ExplanationAgent`'s explanation is scored by a separate **judge LLM** using a 3-level scale:
+
+| Score | Meaning |
+|---|---|
+| **0.0** | Totally wrong — fails to identify any meaningful aspect of the change |
+| **0.5** | Partially correct — right general area but key details wrong or incomplete |
+| **1.0** | Totally correct — identifies affected table, change type, and approximate rows |
+
+The judge reasons step-by-step before assigning a score.
+
+### Fallback Handling
+
+When an agent cannot produce a real LLM response (LLM call failure, max turns reached, empty output), the result is marked `is_fallback=True`. Fallback results:
+- Receive an automatic **score of 0**.
+- **Skip the judge entirely** (no LLM call wasted on evaluating a non-answer).
+- Are clearly logged with `FALLBACK triggered` messages.
 
 ---
 
@@ -304,15 +327,6 @@ python main.py \
   --workers 10
 ```
 
-**Custom dataset and output directory:**
-```bash
-python main.py \
-  --dataset /data/my_dataset.json \
-  --db-dir /data/my_databases \
-  --output-dir ./my_run_output \
-  --samples 100
-```
-
 ---
 
 ## Output
@@ -330,36 +344,35 @@ A JSON array of `RunResult` objects, one per processed record:
     "db_id": "retails",
     "explanation": {
       "record_id": 1,
-      "explanation": "The part 'pink powder drab lawn cyan' was deleted from the 'part' table, causing it to disappear from the query result.",
+      "explanation": "The part 'pink powder drab lawn cyan' was deleted from the 'part' table.",
       "root_cause": "A row was deleted from the 'part' table.",
       "turns_used": 3,
-      "conversation": [
-        {"role": "investigator", "content": "Does the part 'pink powder...' still exist?"},
-        {"role": "user", "content": "No, that record is no longer in the database."}
-      ]
+      "conversation": [],
+      "is_fallback": false
     },
     "fix": {
       "record_id": 1,
       "fix_sql": "INSERT INTO part (p_partkey, p_name, ...) VALUES (42, 'pink powder drab lawn cyan', ...);",
       "confidence": 0.92,
-      "reasoning": "The explanation confirms the row was deleted. I asked for the original values and reconstructed the INSERT.",
+      "reasoning": "The explanation confirms the row was deleted. I asked for the original values.",
       "questions_asked": 1,
       "conversation": [
-        {"role": "investigator", "content": "What were the original column values for that part?"},
-        {"role": "user", "content": "The row had p_partkey=42, p_name='pink powder drab lawn cyan', ..."}
-      ]
+        {"role": "FixAgent", "content": "What were the original column values for that part?"},
+        {"role": "UserAgent", "content": "The row had p_partkey=42, p_name='pink powder drab lawn cyan', ..."}
+      ],
+      "is_fallback": false
     },
     "evaluation": {
       "record_id": 1,
       "db_id": "retails",
-      "explanation_score": 0.95,
-      "explanation_reasoning": "The investigator correctly identified the deleted table and row.",
-      "db_match": true,
-      "db_diff": "",
+      "explanation_score": 1.0,
+      "explanation_reasoning": "Correctly identified the deleted table and row.",
+      "fix_score": 1.5,
+      "fix_description": "gold_result matches, no corruption, and all rows fully restored",
       "questions_asked": 1,
       "question_penalty": 0.05,
-      "base_score": 1.0,
-      "final_score": 0.95,
+      "base_score": 1.5,
+      "final_score": 1.45,
       "error": null
     }
   }
@@ -373,11 +386,20 @@ Aggregate metrics across all processed records:
 ```json
 {
   "total_records": 20,
-  "db_match_count": 14,
-  "db_match_rate": "70.0%",
-  "avg_explanation_score": 0.812,
-  "avg_final_score": 0.634,
-  "avg_questions_asked": 1.15
+  "avg_fix_score": 1.125,
+  "avg_explanation_score": 0.775,
+  "avg_final_score": 0.975,
+  "avg_questions_asked": 1.15,
+  "explanation_score_distribution": {
+    "score_0.0": 2,
+    "score_0.5": 7,
+    "score_1.0": 11
+  },
+  "fix_score_distribution": {
+    "score_0.0": 3,
+    "score_1.0": 9,
+    "score_1.5": 8
+  }
 }
 ```
 
@@ -387,46 +409,63 @@ Aggregate metrics across all processed records:
 
 ### UserAgent
 
-- **Initialization**: Creates a temporary SQLite sandbox (copy of original DB with `altering_sql` applied). Also retains a path to the unaltered original DB and pre-computes the diff between them.
-- **Inner ReAct loop**: The LLM may issue `run_query_original` or `run_query_altered` actions (SELECT only — writes are blocked) before providing a `respond` action. Up to 3 inner iterations per question.
-- **Information policy**: Knows the full diff between original and altered databases but only reveals information when directly asked. Never reveals the literal DML SQL.
-- **Shared history**: The same conversation history is shared across `ExplanationAgent` and `FixAgent` sessions, ensuring consistent answers.
-- **Cleanup**: `user_agent.cleanup()` destroys the sandbox. Called in a `finally` block to guarantee cleanup even on error.
-- **Public property**: `sandbox_path` exposes the altered sandbox path for `ExplanationAgent` direct queries.
+- **No SQL access**: Receives a pre-computed structured text diff showing exactly which rows differ between the original and altered databases, formatted as readable tables.
+- **Single LLM call**: Each `respond()` call makes one LLM request (no inner tool loop). The LLM answers based on the diff text, alteration context, and conversation history.
+- **Information policy**: Knows the full diff but only reveals information when directly asked. Never reveals the literal DML SQL.
+- **Shared history**: The same conversation history is shared across `FixAgent` sessions, ensuring consistent answers.
+- **Diff computation**: `runner.py` uses `compute_structured_diff()` to identify row-level changes using primary keys (falls back to full-row comparison when PKs are unavailable), then `format_diff_as_text()` to produce readable tables.
 
 ### ExplanationAgent
 
+- **Fully autonomous**: Does NOT interact with the UserAgent or any human. Uses only `run_query` tool calls to inspect the altered database directly.
 - **Goal**: Independently discover what changed in the database — no ground-truth information is provided.
-- **Direct DB access**: Can execute SELECT queries directly on the altered database via the `run_query` action, without going through the UserAgent.
-- **Oracle access**: Can also ask the UserAgent targeted questions via `ask_question` when DB inspection alone is insufficient (e.g. "what was the original value?").
-- **Turn limit**: Configurable via `--max-explanation-turns` (default: 6). Counts both `run_query` and `ask_question` actions.
-- **Output**: `ExplanationResult` with `explanation`, `root_cause`, `turns_used`, and the full `conversation` log.
+- **Turn limit**: Configurable via `--max-explanation-turns` (default: 6). Counts `run_query` actions.
+- **Output**: `ExplanationResult` with `explanation`, `root_cause`, `turns_used`, and `is_fallback`.
 
 ### FixAgent
 
-- **Goal**: Produce SQL that, when applied to the altered database, fully restores it to its original state.
+- **Goal**: Produce SQL that, when applied to the altered database, restores the expected query results without corrupting other records.
 - **Inputs**: `ExplanationResult` (explanation + root_cause), database schema (DDL), and query context.
 - **Oracle access**: Can ask the UserAgent clarifying questions (e.g. original column values). Each question incurs a `question_penalty` deduction.
 - **Turn limit**: Configurable via `--max-fix-turns` (default: 4).
-- **Output**: `FixResult` with `fix_sql`, `confidence`, `reasoning`, and `questions_asked`.
+- **Output**: `FixResult` with `fix_sql`, `confidence`, `reasoning`, `questions_asked`, and `is_fallback`.
 
 ### Evaluator
 
 **Explanation evaluation (LLM-as-judge)**:
-- A judge LLM receives the ground-truth alteration info (`altering_sql`, `alteration_explanation`, `targeted_records`) alongside the agent's `explanation` and `root_cause`.
-- The judge returns a score (0.0–1.0) and a reasoning string.
+- A judge LLM receives the ground-truth alteration info alongside the agent's explanation.
+- Returns a score (0.0, 0.5, or 1.0) and step-by-step reasoning.
+- Judge is skipped for fallback results (automatic score 0).
 - Judge LLM is independently configurable and defaults to the UserAgent's LLM settings.
 
-**Fix evaluation (database comparison)**:
-- A fresh sandbox is created: original DB → apply `altering_sql` → apply `fix_sql`.
-- Every table in the result is compared against the original database (row-by-row, order-insensitive using set equality).
-- `db_match = True` only if all tables are identical — no partial credit.
+**Fix evaluation (relaxed — gold_result match + no corruption)**:
+- A fresh sandbox is created: original DB -> apply `altering_sql` -> apply `fix_sql`.
+- **Primary check**: Run `gold_sql` on the fixed DB. Does it return `gold_result`? Are previously-good records still intact?
+- **Bonus check**: If additionally all corrupted rows are fully restored to their original values, score is 1.5 instead of 1.0.
 
 **Score formula**:
 ```
-base_score  = 1.0  if db_match else 0.0
-final_score = max(0.0, base_score − question_penalty × questions_asked)
+final_score = max(0.0, fix_score - question_penalty * questions_asked)
 ```
+
+---
+
+## Logging
+
+All modules use Python's standard `logging` module with the same configuration as the `data_debugging_scenario` pipeline:
+
+```
+%(asctime)s [%(levelname)s] %(name)s: %(message)s
+```
+
+- **INFO**: Agent invocations, tool calls, scoring events, sandbox lifecycle.
+- **DEBUG**: LLM requests/responses, query results, diff details, message counts.
+- **WARNING**: Fallback triggers (with `FALLBACK` keyword), recoverable errors, retries.
+- **ERROR**: Non-recoverable LLM failures.
+
+Agent log lines include bracketed prefixes: `[UserAgent]`, `[ExplanationAgent]`, `[FixAgent]`, `[JudgeAgent]`, `[Evaluator]`.
+
+Set log level via `--log-level DEBUG|INFO|WARNING|ERROR`.
 
 ---
 
@@ -435,12 +474,12 @@ final_score = max(0.0, base_score − question_penalty × questions_asked)
 | Module | Key symbols |
 |---|---|
 | `config.py` | `AgentLLMConfig`, `USER_AGENT_CONFIG`, `EXPLANATION_AGENT_CONFIG`, `FIX_AGENT_CONFIG`, `JUDGE_CONFIG`, `MAX_EXPLANATION_TURNS`, `MAX_FIX_TURNS`, `QUESTION_PENALTY` |
-| `models.py` | `DatasetRecord`, `ExplanationAgentStep`, `FixAgentStep`, `UserAgentStep`, `ExplanationResult`, `FixResult`, `EvaluationResult`, `RunResult`, `ConversationTurn` |
+| `models.py` | `DatasetRecord`, `ExplanationAgentStep`, `FixAgentStep`, `ExplanationResult`, `FixResult`, `EvaluationResult`, `RunResult`, `ConversationTurn` |
 | `llm_client.py` | `LLMClient` (OpenAI), `GeminiClient`, `ChatResult` |
-| `database_utils.py` | `get_db_path()`, `run_select_query()`, `get_ddl()`, `create_altered_sandbox()`, `destroy_sandbox()`, `compare_databases()` |
+| `database_utils.py` | `get_db_path()`, `run_select_query()`, `get_ddl()`, `create_altered_sandbox()`, `destroy_sandbox()`, `compare_databases()`, `compute_structured_diff()`, `format_diff_as_text()` |
 | `prompts.py` | `USER_AGENT_SYSTEM_PROMPT`, `EXPLANATION_AGENT_SYSTEM_PROMPT`, `FIX_AGENT_SYSTEM_PROMPT`, `JUDGE_SYSTEM_PROMPT` |
-| `user_agent.py` | `UserAgent.respond()`, `UserAgent.cleanup()`, `UserAgent.sandbox_path` |
-| `explanation_agent.py` | `ExplanationAgent.run(user_agent)` |
+| `user_agent.py` | `UserAgent.respond()` |
+| `explanation_agent.py` | `ExplanationAgent.run()` |
 | `fix_agent.py` | `FixAgent.run(user_agent)` |
 | `evaluator.py` | `evaluate(record, fix_result, explanation_result, judge_llm, ...)` |
 | `runner.py` | `run_record(record, user_llm, explanation_llm, fix_llm, judge_llm, ...)` |

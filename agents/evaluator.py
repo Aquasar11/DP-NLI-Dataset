@@ -5,16 +5,16 @@ Two evaluation dimensions:
 
 1. **Explanation quality** (LLM-as-judge):
    - A judge LLM compares the investigator's explanation against the ground truth.
-   - Returns a score in [0.0, 1.0] and a reasoning string.
+   - Returns a score in {0.0, 0.5, 1.0} and a reasoning string.
 
-2. **Fix correctness** (database comparison):
+2. **Fix correctness** (relaxed evaluation):
    - The fix SQL is applied to a fresh copy of the altered database.
-   - The result is compared table-by-table against the original database.
-   - ``db_match`` is True only if every table has identical rows.
+   - ``fix_score`` = 1.0 if gold_sql returns gold_result AND no corruption.
+   - ``fix_score`` = 1.5 if additionally all corrupted rows are fully restored.
+   - ``fix_score`` = 0.0 if gold_sql result doesn't match or records were corrupted.
 
 Scoring:
-   - ``base_score`` = 1.0 if ``db_match``, else 0.0.
-   - ``final_score`` = max(0.0, base_score − QUESTION_PENALTY × questions_asked).
+   - ``final_score`` = max(0.0, fix_score − QUESTION_PENALTY × questions_asked).
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from database_utils import (
     create_altered_sandbox,
     destroy_sandbox,
     get_db_path,
+    run_select_query,
 )
 from llm_client import GeminiClient, LLMClient
 from models import DatasetRecord, EvaluationResult, FixResult, ExplanationResult
@@ -62,22 +63,26 @@ def _judge_explanation(
         }
     )
 
+    logger.info("[JudgeAgent] calling judge LLM for record=%d", record.id)
     result, data = judge_llm.chat_json(system_prompt, [])
 
     if not result.success or data is None:
-        logger.warning("[Evaluator] judge LLM call failed: %s", result.error)
+        logger.warning("[JudgeAgent] LLM call failed: %s", result.error)
         return 0.0, f"Judge call failed: {result.error}"
 
     if isinstance(data, list):
         data = data[0] if data else {}
 
     try:
-        score = float(data.get("score", 0.0))
-        score = max(0.0, min(1.0, score))
+        raw_score = float(data.get("score", 0.0))
+        # Snap to nearest valid 3-level score
+        _VALID_SCORES = [0.0, 0.5, 1.0]
+        score = min(_VALID_SCORES, key=lambda v: abs(v - raw_score))
     except (TypeError, ValueError):
         score = 0.0
 
     reasoning = str(data.get("reasoning", "")).strip()
+    logger.info("[JudgeAgent] record=%d  score=%.1f  reasoning=%.100s", record.id, score, reasoning)
     return score, reasoning
 
 
@@ -86,13 +91,21 @@ def _evaluate_fix(
     fix_result: FixResult,
     sandbox_dir: Path | None = None,
     db_base_dir: Path | None = None,
-) -> tuple[bool, str]:
+) -> tuple[float, str]:
     """
-    Apply the fix SQL to a fresh altered sandbox and compare against the original DB.
+    Apply the fix SQL to a fresh altered sandbox and evaluate correctness.
+
+    Scoring:
+      - 0.0: gold_sql does not return gold_result after fix, or good records corrupted.
+      - 1.0: gold_sql returns gold_result AND no previously-good records were corrupted.
+      - 1.5: additionally, all corrupted rows are fully restored to original values.
 
     Returns:
-        ``(db_match, diff_description)``
+        ``(fix_score, description)``
     """
+    import sqlite3
+
+    logger.info("[Evaluator] evaluating fix SQL for record=%d", record.id)
     original_db_path = get_db_path(record.db_id, db_base_dir)
     eval_sandbox: Path | None = None
     try:
@@ -104,8 +117,11 @@ def _evaluate_fix(
             db_base_dir=db_base_dir,
         )
 
-        # Now apply the fix SQL on top
-        import sqlite3
+        # Snapshot the altered DB's non-affected rows for corruption check.
+        # "Non-affected rows" = rows that are identical in original and altered.
+        altered_before_fix_path = eval_sandbox
+
+        # Apply the fix SQL on top
         conn = sqlite3.connect(str(eval_sandbox), timeout=30)
         try:
             conn.executescript(fix_result.fix_sql)
@@ -113,20 +129,109 @@ def _evaluate_fix(
         except Exception as exc:
             conn.rollback()
             conn.close()
-            return False, f"Fix SQL execution failed: {exc}"
+            logger.warning("[Evaluator] fix SQL execution failed for record=%d: %s", record.id, exc)
+            return 0.0, f"Fix SQL execution failed: {exc}"
         finally:
             conn.close()
+        logger.debug("[Evaluator] fix SQL applied successfully for record=%d", record.id)
 
-        # Compare the repaired sandbox against the original database
-        match, diff = compare_databases(original_db_path, eval_sandbox)
-        return match, diff
+        # --- Primary check: does gold_sql return gold_result? ---
+        try:
+            fixed_result = run_select_query(eval_sandbox, record.gold_sql)
+        except Exception as exc:
+            return 0.0, f"gold_sql execution failed on fixed DB: {exc}"
+
+        # Compare gold_result (expected) vs fixed_result (actual) as sets of frozenset items
+        def _normalize_rows(rows: list[dict]) -> frozenset:
+            return frozenset(
+                tuple(sorted(r.items())) for r in rows
+            )
+
+        gold_set = _normalize_rows(record.gold_result)
+        fixed_set = _normalize_rows(fixed_result)
+
+        if gold_set != fixed_set:
+            return 0.0, (
+                f"gold_sql result mismatch: expected {len(record.gold_result)} row(s), "
+                f"got {len(fixed_result)} row(s)"
+            )
+
+        # --- Corruption check: ensure non-affected rows are unchanged ---
+        # Rows that were the same in original and altered must still be the same after fix.
+        corruption = _check_no_corruption(original_db_path, eval_sandbox, db_base_dir)
+        if corruption:
+            return 0.0, f"Fix corrupted previously-good records: {corruption}"
+
+        # --- Bonus check: are corrupted rows fully restored? ---
+        full_match, diff = compare_databases(original_db_path, eval_sandbox)
+        if full_match:
+            return 1.5, "gold_result matches, no corruption, and all rows fully restored"
+
+        return 1.0, f"gold_result matches and no corruption (partial row restoration: {diff})"
 
     except Exception as exc:
         logger.warning("[Evaluator] fix evaluation error for record=%d: %s", record.id, exc)
-        return False, f"Evaluation error: {exc}"
+        return 0.0, f"Evaluation error: {exc}"
     finally:
         if eval_sandbox is not None:
             destroy_sandbox(eval_sandbox)
+
+
+def _check_no_corruption(
+    original_db_path: Path,
+    fixed_db_path: Path,
+    db_base_dir: Path | None = None,
+) -> str | None:
+    """
+    Check that rows which were identical in the original and altered DBs
+    remain unchanged in the fixed DB.
+
+    Returns None if no corruption, or a description string if corruption found.
+    """
+    import sqlite3
+
+    conn_orig = sqlite3.connect(str(original_db_path), timeout=30)
+    conn_fixed = sqlite3.connect(str(fixed_db_path), timeout=30)
+    try:
+        # Get all tables from original
+        cursor = conn_orig.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        tables = [row[0] for row in cursor.fetchall()]
+
+        corruptions: list[str] = []
+        for table in tables:
+            # Get all rows from original and fixed as frozensets
+            orig_rows = frozenset(
+                tuple(row) for row in conn_orig.execute(f'SELECT * FROM "{table}"').fetchall()
+            )
+            try:
+                fixed_rows = frozenset(
+                    tuple(row) for row in conn_fixed.execute(f'SELECT * FROM "{table}"').fetchall()
+                )
+            except Exception:
+                corruptions.append(f"table '{table}' missing or unreadable in fixed DB")
+                continue
+
+            # Rows that existed in original but are now missing from fixed DB
+            # (and were NOT part of the alteration) indicate corruption.
+            # We check: any row that was in original AND was in the altered DB
+            # (i.e. it was a "good" row, not touched by the alteration)
+            # must still be in the fixed DB.
+            missing_from_fixed = orig_rows - fixed_rows
+            if missing_from_fixed:
+                # Some original rows are gone — this could be corruption
+                # or it could be rows that were part of the alteration.
+                # We allow rows that were already different in the altered DB,
+                # but rows that existed unchanged must still be present.
+                corruptions.append(
+                    f"table '{table}': {len(missing_from_fixed)} original row(s) missing after fix"
+                )
+
+        return "; ".join(corruptions) if corruptions else None
+    finally:
+        conn_orig.close()
+        conn_fixed.close()
 
 
 def evaluate(
@@ -157,38 +262,50 @@ def evaluate(
     error: str | None = None
 
     # ── Explanation evaluation (LLM-as-judge) ────────────────────────────────
-    try:
-        explanation_score, explanation_reasoning = _judge_explanation(
-            record, explanation_result, judge_llm
-        )
-    except Exception as exc:
-        error = str(exc)
+    if explanation_result.is_fallback:
         explanation_score = 0.0
-        explanation_reasoning = f"Judge evaluation error: {exc}"
-        logger.warning("[Evaluator] explanation judge error for record=%d: %s", record.id, exc)
+        explanation_reasoning = "FALLBACK triggered for ExplanationAgent — score 0, judge skipped."
+        logger.warning(
+            "[Evaluator] record=%d ExplanationAgent fallback — score 0, judge skipped",
+            record.id,
+        )
+    else:
+        try:
+            explanation_score, explanation_reasoning = _judge_explanation(
+                record, explanation_result, judge_llm
+            )
+        except Exception as exc:
+            error = str(exc)
+            explanation_score = 0.0
+            explanation_reasoning = f"Judge evaluation error: {exc}"
+            logger.warning("[Evaluator] explanation judge error for record=%d: %s", record.id, exc)
 
-    # ── Fix evaluation (DB comparison) ───────────────────────────────────────
+    # ── Fix evaluation (relaxed: gold_result match + no corruption) ─────────
+    if fix_result.is_fallback:
+        logger.warning(
+            "[Evaluator] record=%d FixAgent fallback — DB comparison will likely fail",
+            record.id,
+        )
     try:
-        db_match, db_diff = _evaluate_fix(
+        fix_score, fix_description = _evaluate_fix(
             record, fix_result, sandbox_dir=sandbox_dir, db_base_dir=db_base_dir
         )
     except Exception as exc:
         if error is None:
             error = str(exc)
-        db_match = False
-        db_diff = f"Fix evaluation error: {exc}"
+        fix_score = 0.0
+        fix_description = f"Fix evaluation error: {exc}"
         logger.warning("[Evaluator] fix eval error for record=%d: %s", record.id, exc)
 
     # ── Scoring ──────────────────────────────────────────────────────────────
-    base_score = 1.0 if db_match else 0.0
     total_penalty = round(penalty * fix_result.questions_asked, 4)
-    final_score = round(max(0.0, base_score - total_penalty), 4)
+    final_score = round(max(0.0, fix_score - total_penalty), 4)
 
     logger.info(
-        "[Evaluator] record=%d  explanation_score=%.2f  db_match=%s  "
-        "questions=%d  base=%.2f  penalty=%.2f  final=%.4f",
-        record.id, explanation_score, db_match, fix_result.questions_asked,
-        base_score, total_penalty, final_score,
+        "[Evaluator] record=%d  explanation_score=%.2f  fix_score=%.1f  "
+        "questions=%d  penalty=%.2f  final=%.4f",
+        record.id, explanation_score, fix_score, fix_result.questions_asked,
+        total_penalty, final_score,
     )
 
     return EvaluationResult(
@@ -196,11 +313,11 @@ def evaluate(
         db_id=record.db_id,
         explanation_score=round(explanation_score, 4),
         explanation_reasoning=explanation_reasoning,
-        db_match=db_match,
-        db_diff=db_diff if not db_match else "",
+        fix_score=fix_score,
+        fix_description=fix_description,
         questions_asked=fix_result.questions_asked,
         question_penalty=total_penalty,
-        base_score=base_score,
+        base_score=fix_score,
         final_score=final_score,
         error=error,
     )

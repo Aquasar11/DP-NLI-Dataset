@@ -190,3 +190,181 @@ def compare_databases(db_path1: Path, db_path2: Path) -> tuple[bool, str]:
     finally:
         conn1.close()
         conn2.close()
+
+
+def compute_structured_diff(
+    original_db_path: Path,
+    altered_db_path: Path,
+) -> dict[str, Any]:
+    """
+    Compute a structured diff between two SQLite databases, identifying
+    specific row-level changes using primary keys where available.
+
+    For each table with differences, returns the affected original and altered
+    rows. Uses primary keys to match rows when possible; falls back to
+    full-row equality comparison when PKs are unavailable.
+
+    Returns:
+        Dict with structure::
+
+            {
+                "tables": {
+                    "TableName": {
+                        "primary_keys": ["col1", ...],
+                        "columns": ["col1", "col2", ...],
+                        "original_records": [...],  # rows from original that differ/are missing
+                        "altered_records": [...],    # corresponding altered rows
+                    },
+                    ...
+                }
+            }
+    """
+    conn_orig = sqlite3.connect(str(original_db_path), timeout=30)
+    conn_orig.row_factory = sqlite3.Row
+    conn_alt = sqlite3.connect(str(altered_db_path), timeout=30)
+    conn_alt.row_factory = sqlite3.Row
+    try:
+        # Get table lists
+        orig_tables = set(
+            row[0] for row in conn_orig.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        )
+        alt_tables = set(
+            row[0] for row in conn_alt.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        )
+        common_tables = sorted(orig_tables & alt_tables)
+        logger.debug("compute_structured_diff: %d common tables", len(common_tables))
+
+        result_tables: dict[str, Any] = {}
+
+        for table in common_tables:
+            # Identify primary key columns via PRAGMA
+            pragma = conn_orig.execute(f'PRAGMA table_info("{table}")').fetchall()
+            columns = [row[1] for row in pragma]
+            pk_cols = [row[1] for row in pragma if row[5] > 0]  # pk field > 0
+
+            if not pk_cols:
+                logger.warning(
+                    "Table '%s' has no primary key; using full-row comparison", table
+                )
+
+            # Fetch all rows as dicts
+            orig_rows = [dict(r) for r in conn_orig.execute(f'SELECT * FROM "{table}"').fetchall()]
+            alt_rows = [dict(r) for r in conn_alt.execute(f'SELECT * FROM "{table}"').fetchall()]
+
+            original_records: list[dict[str, Any]] = []
+            altered_records: list[dict[str, Any]] = []
+
+            if pk_cols:
+                # Index rows by PK tuple
+                def _pk(row: dict) -> tuple:
+                    return tuple(row[c] for c in pk_cols)
+
+                orig_by_pk = {_pk(r): r for r in orig_rows}
+                alt_by_pk = {_pk(r): r for r in alt_rows}
+
+                # Rows only in original (missing from altered)
+                for pk, row in orig_by_pk.items():
+                    if pk not in alt_by_pk:
+                        original_records.append(row)
+                    elif row != alt_by_pk[pk]:
+                        # Same PK but different values (changed row)
+                        original_records.append(row)
+                        altered_records.append(alt_by_pk[pk])
+
+                # Rows only in altered (added)
+                for pk, row in alt_by_pk.items():
+                    if pk not in orig_by_pk:
+                        altered_records.append(row)
+            else:
+                # No PK — fall back to frozenset comparison
+                orig_set = frozenset(tuple(sorted(r.items())) for r in orig_rows)
+                alt_set = frozenset(tuple(sorted(r.items())) for r in alt_rows)
+
+                only_orig = orig_set - alt_set
+                only_alt = alt_set - orig_set
+
+                original_records = [dict(t) for t in only_orig]
+                altered_records = [dict(t) for t in only_alt]
+
+            if original_records or altered_records:
+                result_tables[table] = {
+                    "primary_keys": pk_cols,
+                    "columns": columns,
+                    "original_records": original_records,
+                    "altered_records": altered_records,
+                }
+                logger.debug(
+                    "Table '%s': %d original-only, %d altered-only record(s)",
+                    table, len(original_records), len(altered_records),
+                )
+
+        return {"tables": result_tables}
+    finally:
+        conn_orig.close()
+        conn_alt.close()
+
+
+def format_diff_as_text(structured_diff: dict[str, Any]) -> str:
+    """
+    Format a structured diff (from :func:`compute_structured_diff`) as
+    human-readable text tables suitable for inclusion in an LLM prompt.
+
+    Each affected table is presented with its original and altered records
+    in a markdown-style table format.
+    """
+    tables = structured_diff.get("tables", {})
+    if not tables:
+        return "No differences detected between original and current database."
+
+    sections: list[str] = []
+
+    for table_name, info in tables.items():
+        columns = info["columns"]
+        original_records = info["original_records"]
+        altered_records = info["altered_records"]
+
+        lines: list[str] = [f"Table: {table_name}", ""]
+
+        if original_records:
+            lines.append("Original Records:")
+            lines.append(_format_table(columns, original_records))
+            lines.append("")
+
+        if altered_records:
+            lines.append("Altered Records:")
+            lines.append(_format_table(columns, altered_records))
+            lines.append("")
+
+        lines.append("Note: Record order within each table is not significant.")
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
+
+
+def _format_table(columns: list[str], rows: list[dict[str, Any]]) -> str:
+    """Format rows as a markdown-style text table."""
+    # Compute column widths
+    col_widths = {c: len(str(c)) for c in columns}
+    for row in rows:
+        for c in columns:
+            val = "NULL" if row.get(c) is None else str(row.get(c, ""))
+            col_widths[c] = max(col_widths[c], len(val))
+
+    # Header
+    header = "| " + " | ".join(str(c).ljust(col_widths[c]) for c in columns) + " |"
+    separator = "|-" + "-|-".join("-" * col_widths[c] for c in columns) + "-|"
+
+    # Rows
+    data_lines: list[str] = []
+    for row in rows:
+        vals = []
+        for c in columns:
+            val = "NULL" if row.get(c) is None else str(row.get(c, ""))
+            vals.append(val.ljust(col_widths[c]))
+        data_lines.append("| " + " | ".join(vals) + " |")
+
+    return "\n".join([header, separator] + data_lines)

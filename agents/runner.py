@@ -2,11 +2,11 @@
 Runner — orchestrates the three-agent pipeline for a single dataset record.
 
 Flow for each record:
-  1. Initialize UserAgent (creates altered sandbox database).
-  2. ExplanationAgent investigates via direct DB queries and Q&A with UserAgent.
+  1. Create altered sandbox database and compute diff for UserAgent.
+  2. ExplanationAgent investigates via direct DB queries (autonomous, no user interaction).
   3. FixAgent receives the explanation and generates SQL to restore the database.
-  4. Evaluator judges the explanation (LLM-as-judge) and the fix (DB comparison).
-  5. UserAgent sandbox is cleaned up.
+  4. Evaluator judges the explanation (LLM-as-judge) and the fix (relaxed DB comparison).
+  5. Sandbox is cleaned up.
 """
 
 from __future__ import annotations
@@ -16,7 +16,13 @@ import time
 from pathlib import Path
 from typing import Union
 
-from database_utils import get_db_path
+from database_utils import (
+    compute_structured_diff,
+    create_altered_sandbox,
+    destroy_sandbox,
+    format_diff_as_text,
+    get_db_path,
+)
 from evaluator import evaluate
 from explanation_agent import ExplanationAgent
 from fix_agent import FixAgent
@@ -72,11 +78,29 @@ def run_record(
             f"Database '{record.db_id}' not found at: {db_path}"
         )
 
+    # ── Create sandbox and compute diff ────────────────────────────────────
+    sandbox_path = create_altered_sandbox(
+        record.db_id,
+        record.altering_sql,
+        sandbox_dir=sandbox_dir,
+        db_base_dir=db_base_dir,
+    )
+    logger.info("Created sandbox for record=%d at %s", record.id, sandbox_path)
+
+    original_db_path = get_db_path(record.db_id, db_base_dir)
+    structured_diff = compute_structured_diff(original_db_path, sandbox_path)
+    diff_text = format_diff_as_text(structured_diff)
+    diff_table_count = len(structured_diff.get("tables", {}))
+    logger.info(
+        "Computed DB diff for record=%d (%d table(s) with differences)",
+        record.id, diff_table_count,
+    )
+
+    # ── Initialize UserAgent (no SQL access, receives diff as text) ────────
     user_agent = UserAgent(
         record=record,
         llm=user_llm,
-        db_base_dir=db_base_dir,
-        sandbox_dir=sandbox_dir,
+        diff_text=diff_text,
     )
 
     try:
@@ -84,10 +108,10 @@ def run_record(
         explanation_agent = ExplanationAgent(
             record=record,
             llm=explanation_llm,
-            altered_db_path=user_agent.sandbox_path,
+            altered_db_path=sandbox_path,
             max_turns=max_explanation_turns,
         )
-        explanation = explanation_agent.run(user_agent)
+        explanation = explanation_agent.run()
         logger.info(
             "ExplanationAgent done  turns=%d  root_cause=%s",
             explanation.turns_used, explanation.root_cause,
@@ -119,13 +143,14 @@ def run_record(
         )
 
     finally:
-        user_agent.cleanup()
+        destroy_sandbox(sandbox_path)
+        logger.info("Sandbox cleaned up for record=%d", record.id)
 
     elapsed = round(time.perf_counter() - t_start, 2)
     logger.info(
-        "Record id=%d done in %.1fs — db_match=%s  explanation_score=%.2f  final_score=%.4f",
+        "Record id=%d done in %.1fs — fix_score=%.1f  explanation_score=%.2f  final_score=%.4f",
         record.id, elapsed,
-        evaluation.db_match, evaluation.explanation_score, evaluation.final_score,
+        evaluation.fix_score, evaluation.explanation_score, evaluation.final_score,
     )
 
     return RunResult(

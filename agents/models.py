@@ -36,18 +36,13 @@ class ExplanationAgentStep(BaseModel):
 
     action: str = Field(
         description=(
-            "'run_query' to inspect the database directly, "
-            "'ask_question' to query the database owner, or "
+            "'run_query' to inspect the database directly, or "
             "'done' to submit the final explanation"
         )
     )
     sql: str | None = Field(
         None,
         description="SELECT query to run directly on the database (required when action='run_query')",
-    )
-    question: str | None = Field(
-        None,
-        description="Question to ask the database owner (required when action='ask_question')",
     )
     explanation: str | None = Field(
         None,
@@ -88,32 +83,12 @@ class FixAgentStep(BaseModel):
     )
 
 
-class UserAgentStep(BaseModel):
-    """One inner-loop decision step produced by the UserAgent LLM."""
-
-    action: str = Field(
-        description=(
-            "'run_query_original' to query the original database, "
-            "'run_query_altered' to query the current (altered) database, "
-            "or 'respond' to give a final answer"
-        )
-    )
-    sql: str | None = Field(
-        None,
-        description="SELECT query to run (required when action starts with 'run_query')",
-    )
-    answer: str | None = Field(
-        None,
-        description="Final text answer to the question (required when action='respond')",
-    )
-
-
 # ── Agent run results ────────────────────────────────────────────────────────
 
 class ConversationTurn(BaseModel):
     """A single turn in an agent–user conversation."""
 
-    role: str    # "investigator" | "user"
+    role: str    # "ExplanationAgent" | "FixAgent" | "UserAgent"
     content: str
 
 
@@ -125,6 +100,7 @@ class ExplanationResult(BaseModel):
     root_cause: str
     turns_used: int
     conversation: list[ConversationTurn]
+    is_fallback: bool = False
 
 
 class FixResult(BaseModel):
@@ -136,6 +112,7 @@ class FixResult(BaseModel):
     reasoning: str
     questions_asked: int
     conversation: list[ConversationTurn]
+    is_fallback: bool = False
 
 
 # ── Evaluation ───────────────────────────────────────────────────────────────
@@ -148,13 +125,13 @@ class EvaluationResult(BaseModel):
     # Explanation quality (LLM-as-judge)
     explanation_score: float        # 0.0–1.0 from judge LLM
     explanation_reasoning: str      # judge's reasoning
-    # Fix correctness (DB comparison)
-    db_match: bool                  # True if fix_sql fully restores the database
-    db_diff: str                    # diff description when db_match is False
+    # Fix correctness (relaxed evaluation)
+    fix_score: float                # 0.0 = fail, 1.0 = gold_result OK + no corruption, 1.5 = full restore
+    fix_description: str            # human-readable description of fix evaluation result
     # Scoring
     questions_asked: int
     question_penalty: float         # total deduction (penalty × questions_asked)
-    base_score: float               # 1.0 if db_match, else 0.0
+    base_score: float               # same as fix_score
     final_score: float              # base_score − question_penalty, clamped to [0, 1]
     error: str | None = None
 

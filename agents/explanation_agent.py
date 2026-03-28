@@ -1,9 +1,8 @@
 """
 ExplanationAgent — independently investigates and explains the database alteration.
 
-The agent can:
-  1. Run SELECT queries directly on the altered database (run_query tool).
-  2. Ask the UserAgent targeted questions when DB inspection isn't enough.
+The agent operates fully autonomously using only direct database queries
+(run_query tool). It does not interact with the UserAgent or any human.
 
 The goal is to identify WHAT changed in the database without being told —
 it must discover the issue on its own through investigation.
@@ -14,18 +13,16 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Union
+from typing import Any, Union
 
 from database_utils import run_select_query
 from llm_client import GeminiClient, LLMClient
 from models import (
-    ConversationTurn,
     DatasetRecord,
     ExplanationAgentStep,
     ExplanationResult,
 )
 from prompts import EXPLANATION_AGENT_SYSTEM_PROMPT
-from user_agent import UserAgent
 
 import config
 
@@ -36,9 +33,8 @@ class ExplanationAgent:
     """
     Investigates a data anomaly and produces a human-readable explanation.
 
-    The agent uses a structured action loop with three possible actions:
+    The agent operates fully autonomously using a structured action loop:
       - ``run_query``: execute a SELECT directly on the altered database.
-      - ``ask_question``: submit a targeted question to the UserAgent.
       - ``done``: conclude with a full explanation and root-cause statement.
     """
 
@@ -79,12 +75,13 @@ class ExplanationAgent:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def run(self, user_agent: UserAgent) -> ExplanationResult:
+    def run(self, user_agent: Any = None) -> ExplanationResult:
         """
         Run the explanation investigation loop.
 
-        Args:
-            user_agent: The oracle agent to direct questions to when needed.
+        The agent operates fully autonomously using only run_query tool calls.
+        The user_agent parameter is accepted for backward compatibility but is
+        never called.
 
         Returns:
             :class:`ExplanationResult` with the full explanation and conversation log.
@@ -94,12 +91,15 @@ class ExplanationAgent:
             self._record.id, self._record.db_id,
         )
 
-        conversation: list[ConversationTurn] = []
+        conversation: list = []
         agent_messages: list[dict[str, str]] = []
         turns_used = 0
 
         for turn in range(1, self._max_turns + 1):
-            logger.debug("[ExplanationAgent] turn %d/%d", turn, self._max_turns)
+            logger.debug(
+                "[ExplanationAgent] turn %d/%d  message_count=%d",
+                turn, self._max_turns, len(agent_messages),
+            )
 
             result, data = self._llm.chat_json(self._system_prompt, agent_messages)
 
@@ -140,23 +140,6 @@ class ExplanationAgent:
                     "content": f"Query result: {tool_result}",
                 })
 
-            elif step.action == "ask_question" and step.question:
-                turns_used += 1
-                question = step.question.strip()
-                logger.info("[ExplanationAgent] asking (turn %d): %s", turn, question)
-
-                answer = user_agent.respond(question)
-                logger.info("[ExplanationAgent] user_agent answered: %s", answer)
-
-                conversation.append(ConversationTurn(role="investigator", content=question))
-                conversation.append(ConversationTurn(role="user", content=answer))
-
-                agent_messages.append({"role": "assistant", "content": json.dumps(data)})
-                agent_messages.append({
-                    "role": "user",
-                    "content": f"Database owner's answer: {answer}",
-                })
-
             elif step.action == "done":
                 explanation = (step.explanation or "").strip()
                 root_cause = (step.root_cause or "").strip()
@@ -189,17 +172,14 @@ class ExplanationAgent:
 
         # Fallback if the loop ended without a "done" action
         logger.warning(
-            "[ExplanationAgent] max turns (%d) reached without conclusion for record=%d",
-            self._max_turns, self._record.id,
+            "[ExplanationAgent] FALLBACK triggered for record=%d — assigning score 0",
+            self._record.id,
         )
         return ExplanationResult(
             record_id=self._record.id,
-            explanation=(
-                "Based on the investigation, the query results changed because some "
-                "records that previously satisfied the query conditions were modified "
-                "or removed from the database."
-            ),
-            root_cause="Data modification caused relevant records to become unavailable.",
+            explanation="Agent reached maximum turns without producing an explanation.",
+            root_cause="Agent reached maximum turns without finding the root cause.",
             turns_used=turns_used,
             conversation=conversation,
+            is_fallback=True,
         )

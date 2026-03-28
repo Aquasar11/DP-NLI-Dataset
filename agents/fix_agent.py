@@ -102,7 +102,10 @@ class FixAgent:
         questions_asked = 0
 
         for turn in range(1, self._max_turns + 1):
-            logger.debug("[FixAgent] turn %d/%d", turn, self._max_turns)
+            logger.debug(
+                "[FixAgent] turn %d/%d  message_count=%d",
+                turn, self._max_turns, len(agent_messages),
+            )
 
             result, data = self._llm.chat_json(self._system_prompt, agent_messages)
 
@@ -131,8 +134,8 @@ class FixAgent:
                 answer = user_agent.respond(question)
                 logger.info("[FixAgent] user_agent answered: %s", answer)
 
-                conversation.append(ConversationTurn(role="investigator", content=question))
-                conversation.append(ConversationTurn(role="user", content=answer))
+                conversation.append(ConversationTurn(role="FixAgent", content=question))
+                conversation.append(ConversationTurn(role="UserAgent", content=answer))
 
                 agent_messages.append({"role": "assistant", "content": json.dumps(data)})
                 agent_messages.append({
@@ -142,13 +145,20 @@ class FixAgent:
 
             elif step.action == "done":
                 fix_sql = (step.fix_sql or "").strip() or _FALLBACK_SQL
+                is_fallback = (fix_sql == _FALLBACK_SQL)
                 confidence = step.confidence if step.confidence is not None else 0.0
                 reasoning = (step.reasoning or "").strip()
 
-                logger.info(
-                    "[FixAgent] concluded after %d question(s). confidence=%.2f  fix_sql=%s",
-                    questions_asked, confidence, fix_sql,
-                )
+                if is_fallback:
+                    logger.warning(
+                        "[FixAgent] FALLBACK triggered for record=%d — empty fix_sql, assigning score 0",
+                        self._record.id,
+                    )
+                else:
+                    logger.info(
+                        "[FixAgent] concluded after %d question(s). confidence=%.2f  fix_sql=%s",
+                        questions_asked, confidence, fix_sql,
+                    )
 
                 return FixResult(
                     record_id=self._record.id,
@@ -157,6 +167,7 @@ class FixAgent:
                     reasoning=reasoning,
                     questions_asked=questions_asked,
                     conversation=conversation,
+                    is_fallback=is_fallback,
                 )
 
             else:
@@ -164,8 +175,8 @@ class FixAgent:
                 break
 
         logger.warning(
-            "[FixAgent] max turns (%d) reached without conclusion for record=%d",
-            self._max_turns, self._record.id,
+            "[FixAgent] FALLBACK triggered for record=%d — max turns (%d) reached, assigning score 0",
+            self._record.id, self._max_turns,
         )
         return FixResult(
             record_id=self._record.id,
@@ -174,4 +185,5 @@ class FixAgent:
             reasoning="Agent reached maximum turns without producing a fix.",
             questions_asked=questions_asked,
             conversation=conversation,
+            is_fallback=True,
         )

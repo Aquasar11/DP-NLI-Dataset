@@ -36,34 +36,26 @@ User's concern:
 - The change caused these originally-returned records to disappear or change:
   {targeted_records}
 - Context about the change: {alteration_explanation}
-- You have access to BOTH the original (pre-change) database and the current \
-(modified) database, so you can look up what values were before and after.
+
+━━━ DATABASE DIFFERENCES ━━━
+The following differences were detected between the original and current database:
+{diff_text}
 
 ━━━ YOUR ROLE ━━━
 You are helping investigators understand the data discrepancy.
+You must answer questions based ONLY on the context and database differences \
+provided above. You do NOT have access to SQL queries or any database directly.
 
 Rules you MUST follow:
 1. Answer ONLY what is directly asked — do not volunteer extra information.
-2. You MAY run SELECT queries on either the original or the current database \
-to look up specific data before answering.
-3. Do NOT reveal or describe the exact SQL DML statement used to modify the \
+2. Do NOT reveal or describe the exact SQL DML statement used to modify the \
 database. You may describe WHAT changed (e.g. "that row no longer exists", \
 "the value of column X changed") but NOT HOW (never the literal SQL).
-4. Do not proactively reveal that data has changed — only confirm or deny when \
+3. Do not proactively reveal that data has changed — only confirm or deny when \
 directly asked about specific rows or values.
 
 ━━━ RESPONSE FORMAT (always JSON) ━━━
-To query the original (pre-change) database:
-{{"action": "run_query_original", "sql": "<SELECT ...>", "reasoning": "<why>"}}
-
-To query the current (modified) database:
-{{"action": "run_query_altered", "sql": "<SELECT ...>", "reasoning": "<why>"}}
-
-To give your final answer:
-{{"action": "respond", "answer": "<your answer to the investigator's question>"}}
-
-━━━ DATABASE SCHEMA ━━━
-{ddl}
+{{"answer": "<your answer to the investigator's question>"}}
 """
 
 # ── ExplanationAgent ─────────────────────────────────────────────────────────
@@ -99,27 +91,21 @@ You must do your own investigation — do not assume anything without evidence.
 Investigation strategy:
 1. First inspect the database schema and data directly using run_query.
 2. Compare what you observe against the expected query result to identify gaps.
-3. Ask the database owner targeted questions when you need information you \
-cannot obtain by querying the database directly.
-4. Once you have enough evidence, submit your explanation.
+3. Once you have enough evidence, submit your explanation.
+
+You must work fully autonomously using only the run_query tool. Do not attempt \
+to ask questions — gather all information through database queries.
 
 ━━━ TOOLS AVAILABLE ━━━
-You have two tools:
+You have one tool:
 
-1. **run_query** — Execute a SELECT query directly on the (modified) database.
-   Use this to inspect table contents, count rows, filter data, etc.
-   You do NOT need permission; just run the query.
-
-2. **ask_question** — Ask the database owner a targeted question.
-   Use this sparingly — only when the database query alone cannot answer your \
-   question (e.g. "what did this value used to be?").
+**run_query** — Execute a SELECT query directly on the (modified) database.
+Use this to inspect table contents, count rows, filter data, etc.
+You do NOT need permission; just run the query.
 
 ━━━ RESPONSE FORMAT (always JSON) ━━━
 To run a SELECT query on the database:
 {{"action": "run_query", "sql": "<SELECT ... FROM ...>"}}
-
-To ask the database owner a question:
-{{"action": "ask_question", "question": "<your targeted question>"}}
 
 To submit your final explanation (after gathering enough evidence):
 {{
@@ -221,21 +207,22 @@ Root cause stated by the investigator:
 
 ━━━ YOUR TASK ━━━
 Evaluate whether the investigator's explanation accurately and completely \
-describes the actual database change.
+describes the actual database change. Reason step-by-step before assigning \
+a score.
 
-Scoring criteria:
-- 1.0: The explanation correctly identifies the affected table, the nature of \
-  the change (deletion vs update), and approximately which rows were affected.
-- 0.7–0.9: The explanation is mostly correct but misses some detail (e.g. \
-  correct table but imprecise row description).
-- 0.4–0.6: The explanation is partially correct — identifies the right area \
-  but gets key details wrong.
-- 0.1–0.3: The explanation is mostly wrong but contains a grain of truth.
-- 0.0: The explanation is completely incorrect or irrelevant.
+Scoring — assign exactly one of these three values:
+- 1.0 (Totally correct): The explanation correctly identifies the affected \
+  table, the nature of the change (deletion vs update), and approximately \
+  which rows were affected.
+- 0.5 (Partially correct): The explanation identifies the right general area \
+  (e.g. correct table or correct type of change) but gets key details wrong \
+  or is incomplete.
+- 0.0 (Totally wrong): The explanation is completely incorrect, irrelevant, \
+  or fails to identify any meaningful aspect of the actual change.
 
 ━━━ RESPONSE FORMAT (always JSON) ━━━
 {{
-  "score": <0.0 to 1.0>,
-  "reasoning": "<concise explanation of why you assigned this score>"
+  "score": <0.0, 0.5, or 1.0>,
+  "reasoning": "<step-by-step reasoning, then your final score assignment>"
 }}
 """
