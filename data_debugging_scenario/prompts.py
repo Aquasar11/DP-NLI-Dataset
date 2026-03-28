@@ -54,11 +54,44 @@ def _format_targeted(
             "the record from the result. Instead, change a column that the query "
             "filters on (e.g., a column in the WHERE clause, a JOIN key, or a "
             "column used in a subquery condition).\n"
-            "Set the chosen column(s) to NULL, a default value, or a value that "
-            "breaks the query conditions.\n"
-            'In the response, list the column(s) you modified in "target_columns".'
-        )
+            "COLUMN SELECTION RULES:\n"
+            "- ALWAYS change attribute columns used in query conditions "
+            "(e.g., score, age, status, amount, date, color, salary, category).\n"
+            "- NEVER modify primary key columns or identifier/name columns "
+            "(e.g., id, *_id, name). Use these ONLY in the WHERE clause to "
+            "target the correct row.\n"
+            "- Avoid modifying foreign key columns unless the FK itself is the "
+            "condition being filtered on.\n"
+            "- Set the chosen attribute column(s) to a value that breaks the "
+            "query conditions (e.g., a value outside a range, a different "
+            "category, NULL only if the condition checks for non-NULL).\n"
+            'In the response, list the column(s) you modified in "target_columns".\n\n'
+        ) + MODIFY_EXAMPLES
     return target_desc, action
+
+
+MODIFY_EXAMPLES = """\
+Examples of correct MODIFY behavior:
+
+Example 1 — Gold SQL: SELECT name FROM employees WHERE age > 30 AND salary > 50000
+  GOOD: UPDATE employees SET age = 25 WHERE employee_id = 42;
+  BAD:  UPDATE employees SET employee_id = NULL WHERE employee_id = 42;
+  BAD:  UPDATE employees SET name = NULL WHERE employee_id = 42;
+  Why: age is the filtering attribute — changing it removes the row from the result. \
+Changing employee_id or name destroys the record's identity without targeting the query condition.
+
+Example 2 — Gold SQL: SELECT T1.name FROM students AS T1 JOIN scores AS T2 ON T1.id = T2.student_id WHERE T2.score >= 90
+  GOOD: UPDATE scores SET score = 50 WHERE student_id = 101;
+  BAD:  UPDATE scores SET student_id = NULL WHERE student_id = 101;
+  Why: score is the attribute the query filters on — lowering it excludes the row. \
+Changing student_id breaks the JOIN but also corrupts referential integrity.
+
+Example 3 — Gold SQL: SELECT product_name FROM products WHERE category = 'Electronics' AND price < 1000
+  GOOD: UPDATE products SET category = 'Furniture' WHERE product_id = 7;
+  BAD:  UPDATE products SET product_name = NULL WHERE product_id = 7;
+  Why: category is the condition column — changing it to a different value removes the row \
+from the filtered result.\
+"""
 
 
 # ── Step 1: Alteration SQL Prompt ──────────────────────────────────────────────
@@ -69,11 +102,20 @@ database so that specific records disappear from a query's result.
 
 RULES:
 1. Only output valid SQLite-compatible SQL (DELETE or UPDATE statements).
-2. Be precise: use primary keys or unique identifiers when possible to target \
-exact rows.
-3. If the query involves JOINs, identify which table's row needs to change.
-4. For UPDATE (modify) operations, change column values so the row no longer \
-matches the WHERE, JOIN, or HAVING conditions of the gold query.
+2. In WHERE clauses, use primary keys or unique identifiers to target exact rows.
+3. For UPDATE (modify) operations — CRITICAL column selection:
+   a. ALWAYS modify attribute columns that appear in the gold query's WHERE, \
+JOIN, HAVING, or aggregate conditions (e.g., score, age, status, amount, date, \
+color, salary, category).
+   b. NEVER modify primary key columns or identifier/name columns (e.g., id, \
+*_id, name, title). These should only appear in the WHERE clause to target the \
+correct row.
+   c. Avoid modifying foreign key columns unless the foreign key itself is the \
+condition being filtered on.
+   d. Change the attribute to a value that breaks the condition (e.g., value \
+outside a range, a different category, NULL only if the condition checks for \
+non-NULL).
+4. If the query involves JOINs, identify which table's row needs to change.
 5. Multiple SQL statements should be separated by semicolons.
 
 OUTPUT FORMAT — respond with valid JSON only:
@@ -138,7 +180,9 @@ RULES:
 2. Your alteration must change the output of the aggregate query — the new \
 aggregate result must differ from the original one.
 3. Aim to modify or delete approximately the requested number of underlying rows.
-4. Be precise: use primary keys or unique identifiers when possible.
+4. In WHERE clauses, use primary keys or unique identifiers to target exact \
+rows. For UPDATE statements, modify attribute columns (score, amount, date, \
+status, etc.) — NEVER change primary key or identifier columns.
 5. If the query involves JOINs, identify which table's rows need to change.
 6. Multiple SQL statements should be separated by semicolons.
 
@@ -173,9 +217,11 @@ def build_aggregate_alteration_prompt(
             "the aggregate computation.\n"
             "IMPORTANT: Analyze the gold SQL carefully — look at WHERE clauses, JOIN "
             "conditions, and which columns feed into the aggregate function. Modify "
-            "columns that affect whether a row is counted/summed/averaged.\n"
-            'In the response, list the modified column(s) in "target_columns".'
-        )
+            "attribute columns (score, amount, date, status, etc.) that affect whether "
+            "a row is counted/summed/averaged. NEVER change primary key or identifier "
+            "columns.\n"
+            'In the response, list the modified column(s) in "target_columns".\n\n'
+        ) + MODIFY_EXAMPLES
 
     return f"""\
 ## Database Schema (DDL)
@@ -256,7 +302,8 @@ Previous explanation: {previous_explanation}
 {_format_rows(altered_result)}
 
 Please provide a CORRECTED altering SQL. Think carefully about which table and \
-which exact row(s) need to be altered, using primary keys or unique identifiers.
+which exact row(s) need to be altered. Use primary keys in the WHERE clause to \
+target rows, but modify attribute columns (not identifiers) in the SET clause.
 
 Respond with JSON only:
 {{
@@ -292,9 +339,11 @@ def build_aggregate_retry_prompt(
             "value(s) so that those rows are excluded from, or change the value of, "
             "the aggregate computation.\n"
             "IMPORTANT: Analyze the gold SQL carefully — look at WHERE clauses, JOIN "
-            "conditions, and which columns feed into the aggregate function.\n"
-            'In the response, list the modified column(s) in "target_columns".'
-        )
+            "conditions, and which columns feed into the aggregate function. "
+            "Modify attribute columns (score, amount, date, etc.), NOT primary keys "
+            "or identifiers.\n"
+            'In the response, list the modified column(s) in "target_columns".\n\n'
+        ) + MODIFY_EXAMPLES
 
     return f"""\
 Your previous alteration SQL did NOT change the aggregate result. Please fix it.
