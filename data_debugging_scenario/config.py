@@ -33,7 +33,7 @@ GCP_CREDENTIALS: str = os.getenv("GCP_CREDENTIALS", "")
 
 # ── Gemini (Google Gen AI SDK) ─────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.3"))
 # Set GOOGLE_GENAI_USE_VERTEXAI=True to route through Vertex AI instead of the
 # Gemini Developer API. When using Vertex AI, GOOGLE_CLOUD_PROJECT and
