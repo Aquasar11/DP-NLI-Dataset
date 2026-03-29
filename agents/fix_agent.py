@@ -65,7 +65,6 @@ class FixAgent:
             {
                 "db_id": record.db_id,
                 "gold_sql": record.gold_sql,
-                "gold_result": json.dumps(record.gold_result, default=str),
                 "altered_result": json.dumps(record.altered_result, default=str),
                 "explanation": explanation.explanation,
                 "root_cause": explanation.root_cause,
@@ -172,7 +171,6 @@ class FixAgent:
             elif step.action == "done":
                 fix_sql = (step.fix_sql or "").strip() or _FALLBACK_SQL
                 is_fallback = (fix_sql == _FALLBACK_SQL)
-                confidence = step.confidence if step.confidence is not None else 0.0
                 reasoning = (step.reasoning or "").strip()
 
                 if is_fallback:
@@ -182,14 +180,13 @@ class FixAgent:
                     )
                 else:
                     logger.info(
-                        "[FixAgent] concluded after %d question(s). confidence=%.2f  fix_sql=%s",
-                        questions_asked, confidence, fix_sql,
+                        "[FixAgent] concluded after %d question(s).  fix_sql=%s",
+                        questions_asked, fix_sql,
                     )
 
                 return FixResult(
                     record_id=self._record.id,
                     fix_sql=fix_sql,
-                    confidence=confidence,
                     reasoning=reasoning,
                     questions_asked=questions_asked,
                     conversation=conversation,
@@ -207,7 +204,6 @@ class FixAgent:
         return FixResult(
             record_id=self._record.id,
             fix_sql=_FALLBACK_SQL,
-            confidence=0.0,
             reasoning="Agent reached maximum turns without producing a fix.",
             questions_asked=questions_asked,
             conversation=conversation,

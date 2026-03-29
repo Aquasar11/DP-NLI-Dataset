@@ -60,7 +60,6 @@ class ExplanationAgent:
                 "question": record.question,
                 "evidence": record.evidence,
                 "gold_sql": record.gold_sql,
-                "gold_result": json.dumps(record.gold_result, default=str),
                 "altered_result": json.dumps(record.altered_result, default=str),
                 "follow_up_question": record.follow_up_question,
                 "ddl": ddl,
