@@ -23,6 +23,7 @@ from models import (
     ExplanationResult,
 )
 from prompts import EXPLANATION_AGENT_SYSTEM_PROMPT
+from sample_logger import PipelineLogger
 
 import config
 
@@ -44,11 +45,13 @@ class ExplanationAgent:
         llm: Union[LLMClient, GeminiClient],
         altered_db_path: Path,
         max_turns: int | None = None,
+        pipeline_logger: PipelineLogger | None = None,
     ) -> None:
         self._record = record
         self._llm = llm
         self._altered_db_path = altered_db_path
         self._max_turns = max_turns if max_turns is not None else config.MAX_EXPLANATION_TURNS
+        self._pipeline_logger = pipeline_logger
 
         ddl = self._get_ddl()
         self._system_prompt = EXPLANATION_AGENT_SYSTEM_PROMPT.format_map(
@@ -103,6 +106,19 @@ class ExplanationAgent:
 
             result, data = self._llm.chat_json(self._system_prompt, agent_messages)
 
+            if self._pipeline_logger:
+                self._pipeline_logger.log_llm_call(
+                    agent="ExplanationAgent",
+                    step=f"turn_{turn}",
+                    system_prompt=self._system_prompt,
+                    messages=list(agent_messages),
+                    raw_response=result.content if result.content else None,
+                    parsed_response=data,
+                    success=result.success,
+                    error=result.error,
+                    duration_seconds=result.duration_seconds,
+                )
+
             if not result.success or data is None:
                 logger.error("[ExplanationAgent] LLM call failed: %s", result.error)
                 break
@@ -124,6 +140,8 @@ class ExplanationAgent:
                 first_stmt = next((s.strip() for s in sql.split(";") if s.strip()), sql)
                 logger.info("[ExplanationAgent] running query (turn %d): %s", turn, first_stmt)
 
+                query_success = True
+                query_error = None
                 try:
                     rows = run_select_query(self._altered_db_path, first_stmt)
                     tool_result = (
@@ -131,8 +149,21 @@ class ExplanationAgent:
                         + json.dumps(rows[:20], default=str)
                     )
                 except Exception as exc:
+                    query_success = False
+                    query_error = str(exc)
                     tool_result = f"Query failed: {exc}"
                     logger.warning("[ExplanationAgent] query error: %s", exc)
+
+                if self._pipeline_logger:
+                    self._pipeline_logger.log_tool_call(
+                        agent="ExplanationAgent",
+                        step=f"turn_{turn}",
+                        tool="run_query",
+                        input_data={"sql": first_stmt},
+                        output_data=tool_result,
+                        success=query_success,
+                        error=query_error,
+                    )
 
                 agent_messages.append({"role": "assistant", "content": json.dumps(data)})
                 agent_messages.append({

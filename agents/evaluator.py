@@ -33,6 +33,7 @@ from database_utils import (
 from llm_client import GeminiClient, LLMClient
 from models import DatasetRecord, EvaluationResult, FixResult, ExplanationResult
 from prompts import JUDGE_SYSTEM_PROMPT
+from sample_logger import PipelineLogger
 
 import config
 
@@ -43,6 +44,7 @@ def _judge_explanation(
     record: DatasetRecord,
     explanation_result: ExplanationResult,
     judge_llm: Union[LLMClient, GeminiClient],
+    pipeline_logger: PipelineLogger | None = None,
 ) -> tuple[float, str]:
     """
     Use the judge LLM to score the explanation quality.
@@ -65,6 +67,19 @@ def _judge_explanation(
 
     logger.info("[JudgeAgent] calling judge LLM for record=%d", record.id)
     result, data = judge_llm.chat_json(system_prompt, [])
+
+    if pipeline_logger:
+        pipeline_logger.log_llm_call(
+            agent="Judge",
+            step="judge",
+            system_prompt=system_prompt,
+            messages=[],
+            raw_response=result.content if result.content else None,
+            parsed_response=data,
+            success=result.success,
+            error=result.error,
+            duration_seconds=result.duration_seconds,
+        )
 
     if not result.success or data is None:
         logger.warning("[JudgeAgent] LLM call failed: %s", result.error)
@@ -242,6 +257,7 @@ def evaluate(
     question_penalty: float | None = None,
     sandbox_dir: Path | None = None,
     db_base_dir: Path | None = None,
+    pipeline_logger: PipelineLogger | None = None,
 ) -> EvaluationResult:
     """
     Evaluate both the ExplanationAgent and FixAgent outputs for one record.
@@ -272,7 +288,7 @@ def evaluate(
     else:
         try:
             explanation_score, explanation_reasoning = _judge_explanation(
-                record, explanation_result, judge_llm
+                record, explanation_result, judge_llm, pipeline_logger=pipeline_logger
             )
         except Exception as exc:
             error = str(exc)

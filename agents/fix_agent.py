@@ -23,6 +23,7 @@ from models import (
     FixResult,
 )
 from prompts import FIX_AGENT_SYSTEM_PROMPT
+from sample_logger import PipelineLogger
 from user_agent import UserAgent
 
 import config
@@ -48,6 +49,7 @@ class FixAgent:
         llm: Union[LLMClient, GeminiClient],
         max_turns: int | None = None,
         question_penalty: float | None = None,
+        pipeline_logger: PipelineLogger | None = None,
     ) -> None:
         self._record = record
         self._explanation = explanation
@@ -56,6 +58,7 @@ class FixAgent:
         self._question_penalty = (
             question_penalty if question_penalty is not None else config.QUESTION_PENALTY
         )
+        self._pipeline_logger = pipeline_logger
 
         ddl = self._get_ddl(record)
         self._system_prompt = FIX_AGENT_SYSTEM_PROMPT.format_map(
@@ -109,6 +112,19 @@ class FixAgent:
 
             result, data = self._llm.chat_json(self._system_prompt, agent_messages)
 
+            if self._pipeline_logger:
+                self._pipeline_logger.log_llm_call(
+                    agent="FixAgent",
+                    step=f"turn_{turn}",
+                    system_prompt=self._system_prompt,
+                    messages=list(agent_messages),
+                    raw_response=result.content if result.content else None,
+                    parsed_response=data,
+                    success=result.success,
+                    error=result.error,
+                    duration_seconds=result.duration_seconds,
+                )
+
             if not result.success or data is None:
                 logger.error("[FixAgent] LLM call failed: %s", result.error)
                 break
@@ -133,6 +149,16 @@ class FixAgent:
 
                 answer = user_agent.respond(question)
                 logger.info("[FixAgent] user_agent answered: %s", answer)
+
+                if self._pipeline_logger:
+                    self._pipeline_logger.log_tool_call(
+                        agent="FixAgent",
+                        step=f"turn_{turn}",
+                        tool="ask_question",
+                        input_data={"question": question},
+                        output_data=answer,
+                        success=True,
+                    )
 
                 conversation.append(ConversationTurn(role="FixAgent", content=question))
                 conversation.append(ConversationTurn(role="UserAgent", content=answer))
