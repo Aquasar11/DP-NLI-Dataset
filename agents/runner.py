@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Union
 
@@ -28,6 +30,7 @@ from explanation_agent import ExplanationAgent
 from fix_agent import FixAgent
 from llm_client import GeminiClient, LLMClient
 from models import DatasetRecord, RunResult
+from sample_logger import PipelineLogger, SampleLog
 from user_agent import UserAgent
 
 import config
@@ -46,26 +49,17 @@ def run_record(
     max_explanation_turns: int | None = None,
     max_fix_turns: int | None = None,
     question_penalty: float | None = None,
-) -> RunResult:
+) -> tuple[RunResult, SampleLog]:
     """
     Run the full three-agent pipeline for one dataset record.
 
-    Args:
-        record: The dataset record to process.
-        user_llm: LLM client for the UserAgent.
-        explanation_llm: LLM client for the ExplanationAgent.
-        fix_llm: LLM client for the FixAgent.
-        judge_llm: LLM client for the explanation judge.
-        db_base_dir: Override for directory containing database files.
-        sandbox_dir: Override for sandbox directory.
-        max_explanation_turns: Override for ExplanationAgent turn limit.
-        max_fix_turns: Override for FixAgent turn limit.
-        question_penalty: Override for per-question score penalty.
-
     Returns:
-        :class:`RunResult` with explanation, fix, and evaluation.
+        Tuple of :class:`RunResult` and :class:`SampleLog` with full event log.
     """
     t_start = time.perf_counter()
+    timestamp_start = datetime.now(timezone.utc).isoformat()
+    pipeline_logger = PipelineLogger()
+
     logger.info(
         "━━━ Processing record id=%d  db=%s ━━━",
         record.id, record.db_id,
@@ -101,6 +95,26 @@ def run_record(
         record=record,
         llm=user_llm,
         diff_text=diff_text,
+        pipeline_logger=pipeline_logger,
+    )
+
+    # Prepare SampleLog shell
+    sample_log = SampleLog(
+        record_id=record.id,
+        db_id=record.db_id,
+        question=record.question,
+        evidence=record.evidence,
+        gold_sql=record.gold_sql,
+        gold_result=record.gold_result,
+        alteration_type=record.alteration_type,
+        altering_sql=record.altering_sql,
+        altered_result=record.altered_result,
+        alteration_explanation=record.alteration_explanation,
+        follow_up_question=record.follow_up_question,
+        sandbox_path=str(sandbox_path),
+        diff_tables_count=diff_table_count,
+        diff_text=diff_text,
+        timestamp_start=timestamp_start,
     )
 
     try:
@@ -110,12 +124,14 @@ def run_record(
             llm=explanation_llm,
             altered_db_path=sandbox_path,
             max_turns=max_explanation_turns,
+            pipeline_logger=pipeline_logger,
         )
         explanation = explanation_agent.run()
         logger.info(
             "ExplanationAgent done  turns=%d  root_cause=%s",
             explanation.turns_used, explanation.root_cause,
         )
+        sample_log.explanation_result = explanation.model_dump()
 
         # ── Step 2: FixAgent ──────────────────────────────────────────────────
         fix_agent = FixAgent(
@@ -124,12 +140,14 @@ def run_record(
             llm=fix_llm,
             max_turns=max_fix_turns,
             question_penalty=question_penalty,
+            pipeline_logger=pipeline_logger,
         )
         fix = fix_agent.run(user_agent)
         logger.info(
             "FixAgent done  questions_asked=%d  confidence=%.2f  fix_sql=%s",
             fix.questions_asked, fix.confidence, fix.fix_sql,
         )
+        sample_log.fix_result = fix.model_dump()
 
         # ── Step 3: Evaluator ─────────────────────────────────────────────────
         evaluation = evaluate(
@@ -140,23 +158,38 @@ def run_record(
             question_penalty=question_penalty,
             sandbox_dir=sandbox_dir,
             db_base_dir=db_base_dir,
+            pipeline_logger=pipeline_logger,
         )
+        sample_log.evaluation_result = evaluation.model_dump()
+
+    except Exception as exc:
+        sample_log.status = "error"
+        sample_log.error = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "Record id=%d pipeline error: %s", record.id, exc, exc_info=True,
+        )
+        return None, sample_log
 
     finally:
         destroy_sandbox(sandbox_path)
         logger.info("Sandbox cleaned up for record=%d", record.id)
 
-    elapsed = round(time.perf_counter() - t_start, 2)
+        # Finalize sample log
+        elapsed = round(time.perf_counter() - t_start, 2)
+        sample_log.total_duration_seconds = elapsed
+        sample_log.events = [asdict(e) for e in pipeline_logger.events]
+
     logger.info(
         "Record id=%d done in %.1fs — fix_score=%.1f  explanation_score=%.2f  final_score=%.4f",
         record.id, elapsed,
         evaluation.fix_score, evaluation.explanation_score, evaluation.final_score,
     )
 
-    return RunResult(
+    run_result = RunResult(
         record_id=record.id,
         db_id=record.db_id,
         explanation=explanation,
         fix=fix,
         evaluation=evaluation,
     )
+    return run_result, sample_log

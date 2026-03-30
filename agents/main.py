@@ -31,6 +31,7 @@ from config import AgentLLMConfig
 from llm_client import GeminiClient, LLMClient
 from models import DatasetRecord, RunResult
 from runner import run_record
+from sample_logger import SampleLog, SampleLogger
 
 
 def parse_args() -> argparse.Namespace:
@@ -351,8 +352,9 @@ def main() -> None:
     t_start = time.time()
     results: list[RunResult] = []
     errors: list[str] = []
+    sample_logger = SampleLogger(output_dir)
 
-    def _process(record: DatasetRecord) -> RunResult | None:
+    def _process(record: DatasetRecord) -> tuple[RunResult | None, SampleLog]:
         try:
             return run_record(
                 record=record,
@@ -367,21 +369,42 @@ def main() -> None:
                 question_penalty=args.question_penalty,
             )
         except Exception as exc:
+            # Errors before runner creates its SampleLog (e.g., DB not found)
             logger.error("record=%d failed: %s", record.id, exc, exc_info=True)
-            return None
+            error_log = SampleLog(
+                record_id=record.id,
+                db_id=record.db_id,
+                question=record.question,
+                evidence=record.evidence,
+                gold_sql=record.gold_sql,
+                gold_result=record.gold_result,
+                alteration_type=record.alteration_type,
+                altering_sql=record.altering_sql,
+                altered_result=record.altered_result,
+                alteration_explanation=record.alteration_explanation,
+                follow_up_question=record.follow_up_question,
+                sandbox_path="",
+                diff_tables_count=0,
+                diff_text="",
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return None, error_log
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {executor.submit(_process, rec): rec for rec in records}
         for future in tqdm(as_completed(futures), total=len(records), desc="Processing"):
-            result = future.result()
-            if result is not None:
-                results.append(result)
+            run_result, sample_log = future.result()
+            sample_logger.write(sample_log)
+            if run_result is not None:
+                results.append(run_result)
             else:
                 errors.append(f"record={futures[future].id}")
 
     results.sort(key=lambda r: r.record_id)
 
     # ── Save and report ───────────────────────────────────────────────────
+    sample_logger.consolidate()
     stats, results_path, stats_path = _save_results(results, output_dir)
     elapsed = round(time.time() - t_start, 1)
 

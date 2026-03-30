@@ -19,6 +19,7 @@ from typing import Union
 from llm_client import GeminiClient, LLMClient
 from models import DatasetRecord
 from prompts import USER_AGENT_SYSTEM_PROMPT
+from sample_logger import PipelineLogger
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +42,12 @@ class UserAgent:
         record: DatasetRecord,
         llm: Union[LLMClient, GeminiClient],
         diff_text: str,
+        pipeline_logger: PipelineLogger | None = None,
     ) -> None:
         self._record = record
         self._llm = llm
+        self._pipeline_logger = pipeline_logger
+        self._respond_count = 0
 
         self._system_prompt = USER_AGENT_SYSTEM_PROMPT.format_map(
             {
@@ -87,8 +91,22 @@ class UserAgent:
         messages = list(self._conversation)
         messages.append({"role": "user", "content": question})
 
+        self._respond_count += 1
         logger.info("[UserAgent] calling LLM (message_count=%d)", len(messages))
         result, data = self._llm.chat_json(self._system_prompt, messages)
+
+        if self._pipeline_logger:
+            self._pipeline_logger.log_llm_call(
+                agent="UserAgent",
+                step=f"respond_{self._respond_count}",
+                system_prompt=self._system_prompt,
+                messages=list(messages),
+                raw_response=result.content if result.content else None,
+                parsed_response=data,
+                success=result.success,
+                error=result.error,
+                duration_seconds=result.duration_seconds,
+            )
 
         if not result.success or data is None:
             logger.warning("[UserAgent] FALLBACK — LLM call failed: %s", result.error)

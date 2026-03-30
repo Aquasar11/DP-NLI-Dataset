@@ -45,26 +45,28 @@ def _format_targeted(
         )
     else:
         action = (
-            "MODIFY one or more columns of the above record(s) so that they no "
-            "longer satisfy the query conditions and disappear from the result.\n"
-            "IMPORTANT: Carefully analyze the gold SQL query — look at the WHERE, "
-            "JOIN, HAVING, and other conditions. Choose column(s) that are used "
-            "in those conditions (not just the columns in the SELECT clause). "
-            "Changing a column that only appears in the SELECT will NOT remove "
-            "the record from the result. Instead, change a column that the query "
-            "filters on (e.g., a column in the WHERE clause, a JOIN key, or a "
-            "column used in a subquery condition).\n"
-            "COLUMN SELECTION RULES:\n"
-            "- ALWAYS change attribute columns used in query conditions "
-            "(e.g., score, age, status, amount, date, color, salary, category).\n"
-            "- NEVER modify primary key columns or identifier/name columns "
-            "(e.g., id, *_id, name). Use these ONLY in the WHERE clause to "
-            "target the correct row.\n"
-            "- Avoid modifying foreign key columns unless the FK itself is the "
-            "condition being filtered on.\n"
-            "- Set the chosen attribute column(s) to a value that breaks the "
-            "query conditions (e.g., a value outside a range, a different "
-            "category, NULL only if the condition checks for non-NULL).\n"
+            "MODIFY one or more columns of the above record(s) using UPDATE "
+            "statements so that the targeted record(s) disappear from the result.\n"
+            "CRITICAL: You MUST use UPDATE statements. NEVER use DELETE when the "
+            "required action is MODIFY. Do NOT switch to DELETE under any "
+            "circumstances.\n"
+            "Carefully analyze the gold SQL query — look at the WHERE, JOIN, "
+            "HAVING, and other conditions.\n"
+            "COLUMN SELECTION PRIORITY (follow this order):\n"
+            "1. BEST: Change attribute columns used in WHERE/JOIN/HAVING "
+            "conditions (e.g., score, age, status, amount, date, color, salary, "
+            "category) to a value that breaks the condition.\n"
+            "2. GOOD: If no non-identifier condition columns exist, change "
+            "attribute columns in the SELECT clause to a different value "
+            "(this changes the record's returned values so the original "
+            "targeted record no longer appears).\n"
+            "3. LAST RESORT: Only if no other columns can be changed, modify "
+            "identifier/primary key columns used in WHERE conditions.\n"
+            "Use primary keys or unique identifiers in the WHERE clause of your "
+            "UPDATE statement to target the correct row.\n"
+            "Set the chosen column(s) to a value that breaks the query "
+            "conditions or changes the output (e.g., a value outside a range, "
+            "a different category, a different numeric value).\n"
             'In the response, list the column(s) you modified in "target_columns".\n\n'
         ) + MODIFY_EXAMPLES
     return target_desc, action
@@ -76,9 +78,9 @@ Examples of correct MODIFY behavior:
 Example 1 — Gold SQL: SELECT name FROM employees WHERE age > 30 AND salary > 50000
   GOOD: UPDATE employees SET age = 25 WHERE employee_id = 42;
   BAD:  UPDATE employees SET employee_id = NULL WHERE employee_id = 42;
-  BAD:  UPDATE employees SET name = NULL WHERE employee_id = 42;
+  BAD:  DELETE FROM employees WHERE employee_id = 42;
   Why: age is the filtering attribute — changing it removes the row from the result. \
-Changing employee_id or name destroys the record's identity without targeting the query condition.
+Never use DELETE when told to MODIFY. Never change identifiers when condition columns exist.
 
 Example 2 — Gold SQL: SELECT T1.name FROM students AS T1 JOIN scores AS T2 ON T1.id = T2.student_id WHERE T2.score >= 90
   GOOD: UPDATE scores SET score = 50 WHERE student_id = 101;
@@ -86,7 +88,15 @@ Example 2 — Gold SQL: SELECT T1.name FROM students AS T1 JOIN scores AS T2 ON 
   Why: score is the attribute the query filters on — lowering it excludes the row. \
 Changing student_id breaks the JOIN but also corrupts referential integrity.
 
-Example 3 — Gold SQL: SELECT product_name FROM products WHERE category = 'Electronics' AND price < 1000
+Example 3 — Gold SQL: SELECT StandardCost FROM ProductCostHistory WHERE ProductID = 847
+  GOOD: UPDATE ProductCostHistory SET StandardCost = 0.0 WHERE ProductID = 847;
+  BAD:  DELETE FROM ProductCostHistory WHERE ProductID = 847;
+  BAD:  UPDATE ProductCostHistory SET ProductID = -1 WHERE ProductID = 847;
+  Why: The only WHERE condition is on ProductID (an identifier). Instead of deleting \
+or changing the PK, change the SELECT attribute StandardCost — this changes the \
+returned value so the original targeted record disappears from the result.
+
+Example 4 — Gold SQL: SELECT product_name FROM products WHERE category = 'Electronics' AND price < 1000
   GOOD: UPDATE products SET category = 'Furniture' WHERE product_id = 7;
   BAD:  UPDATE products SET product_name = NULL WHERE product_id = 7;
   Why: category is the condition column — changing it to a different value removes the row \
@@ -102,21 +112,18 @@ database so that specific records disappear from a query's result.
 
 RULES:
 1. Only output valid SQLite-compatible SQL (DELETE or UPDATE statements).
-2. In WHERE clauses, use primary keys or unique identifiers to target exact rows.
-3. For UPDATE (modify) operations — CRITICAL column selection:
-   a. ALWAYS modify attribute columns that appear in the gold query's WHERE, \
-JOIN, HAVING, or aggregate conditions (e.g., score, age, status, amount, date, \
-color, salary, category).
-   b. NEVER modify primary key columns or identifier/name columns (e.g., id, \
-*_id, name, title). These should only appear in the WHERE clause to target the \
-correct row.
-   c. Avoid modifying foreign key columns unless the foreign key itself is the \
-condition being filtered on.
-   d. Change the attribute to a value that breaks the condition (e.g., value \
-outside a range, a different category, NULL only if the condition checks for \
-non-NULL).
-4. If the query involves JOINs, identify which table's row needs to change.
-5. Multiple SQL statements should be separated by semicolons.
+2. NEVER switch between operation types. If the required action says MODIFY, \
+you MUST use UPDATE — never DELETE. If it says DELETE, use DELETE.
+3. In WHERE clauses, use primary keys or unique identifiers to target exact rows.
+4. For UPDATE (modify) operations — column selection priority:
+   a. BEST: Modify attribute columns in the gold query's WHERE, JOIN, HAVING, \
+or aggregate conditions (e.g., score, age, status, amount, date, color, salary).
+   b. GOOD: If no non-identifier condition columns exist, modify attribute \
+columns in the SELECT clause to change the returned values.
+   c. LAST RESORT: Only if no other columns work, modify identifier/primary \
+key columns used in conditions.
+5. If the query involves JOINs, identify which table's row needs to change.
+6. Multiple SQL statements should be separated by semicolons.
 
 OUTPUT FORMAT — respond with valid JSON only:
 {
@@ -177,14 +184,16 @@ than it currently does.
 
 RULES:
 1. Only output valid SQLite-compatible SQL (DELETE or UPDATE statements).
-2. Your alteration must change the output of the aggregate query — the new \
+2. NEVER switch between operation types. If the required action says MODIFY, \
+you MUST use UPDATE — never DELETE. If it says DELETE, use DELETE.
+3. Your alteration must change the output of the aggregate query — the new \
 aggregate result must differ from the original one.
-3. Aim to modify or delete approximately the requested number of underlying rows.
-4. In WHERE clauses, use primary keys or unique identifiers to target exact \
-rows. For UPDATE statements, modify attribute columns (score, amount, date, \
-status, etc.) — NEVER change primary key or identifier columns.
-5. If the query involves JOINs, identify which table's rows need to change.
-6. Multiple SQL statements should be separated by semicolons.
+4. Aim to modify or delete approximately the requested number of underlying rows.
+5. In WHERE clauses, use primary keys or unique identifiers to target exact \
+rows. For UPDATE statements, prefer modifying attribute columns (score, amount, \
+date, status, etc.) over identifiers. Only change identifiers as a last resort.
+6. If the query involves JOINs, identify which table's rows need to change.
+7. Multiple SQL statements should be separated by semicolons.
 
 OUTPUT FORMAT — respond with valid JSON only:
 {

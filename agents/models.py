@@ -71,12 +71,6 @@ class FixAgentStep(BaseModel):
             "(required when action='done')"
         ),
     )
-    confidence: float | None = Field(
-        None,
-        ge=0.0,
-        le=1.0,
-        description="Confidence score between 0 and 1 (required when action='done')",
-    )
     reasoning: str | None = Field(
         None,
         description="Step-by-step reasoning behind the fix (required when action='done')",
@@ -108,7 +102,6 @@ class FixResult(BaseModel):
 
     record_id: int
     fix_sql: str
-    confidence: float
     reasoning: str
     questions_asked: int
     conversation: list[ConversationTurn]

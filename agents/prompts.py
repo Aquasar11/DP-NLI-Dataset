@@ -73,9 +73,6 @@ Hint / evidence:   {evidence}
 SQL query that now produces an unexpected result:
 {gold_sql}
 
-Previously expected result:
-{gold_result}
-
 Current unexpected result:
 {altered_result}
 
@@ -132,9 +129,6 @@ Database:          {db_id}
 SQL query that now returns unexpected results:
 {gold_sql}
 
-Previously expected result:
-{gold_result}
-
 Current unexpected result:
 {altered_result}
 
@@ -171,9 +165,8 @@ To ask a clarifying question (use sparingly — incurs {question_penalty} penalt
 To submit your fix:
 {{
   "action": "done",
-  "fix_sql": "<SQL statement(s) to restore the database>",
-  "confidence": <0.0 to 1.0>,
-  "reasoning": "<step-by-step reasoning behind your fix>"
+  "reasoning": "<step-by-step reasoning behind your fix>",
+  "fix_sql": "<SQL statement(s) to restore the database>"
 }}
 
 ━━━ DATABASE SCHEMA ━━━
@@ -222,7 +215,7 @@ Scoring — assign exactly one of these three values:
 
 ━━━ RESPONSE FORMAT (always JSON) ━━━
 {{
-  "score": <0.0, 0.5, or 1.0>,
   "reasoning": "<step-by-step reasoning, then your final score assignment>"
+  "score": <0.0, 0.5, or 1.0>,
 }}
 """

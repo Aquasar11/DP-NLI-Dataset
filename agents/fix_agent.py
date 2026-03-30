@@ -23,6 +23,7 @@ from models import (
     FixResult,
 )
 from prompts import FIX_AGENT_SYSTEM_PROMPT
+from sample_logger import PipelineLogger
 from user_agent import UserAgent
 
 import config
@@ -48,6 +49,7 @@ class FixAgent:
         llm: Union[LLMClient, GeminiClient],
         max_turns: int | None = None,
         question_penalty: float | None = None,
+        pipeline_logger: PipelineLogger | None = None,
     ) -> None:
         self._record = record
         self._explanation = explanation
@@ -56,13 +58,13 @@ class FixAgent:
         self._question_penalty = (
             question_penalty if question_penalty is not None else config.QUESTION_PENALTY
         )
+        self._pipeline_logger = pipeline_logger
 
         ddl = self._get_ddl(record)
         self._system_prompt = FIX_AGENT_SYSTEM_PROMPT.format_map(
             {
                 "db_id": record.db_id,
                 "gold_sql": record.gold_sql,
-                "gold_result": json.dumps(record.gold_result, default=str),
                 "altered_result": json.dumps(record.altered_result, default=str),
                 "explanation": explanation.explanation,
                 "root_cause": explanation.root_cause,
@@ -109,6 +111,19 @@ class FixAgent:
 
             result, data = self._llm.chat_json(self._system_prompt, agent_messages)
 
+            if self._pipeline_logger:
+                self._pipeline_logger.log_llm_call(
+                    agent="FixAgent",
+                    step=f"turn_{turn}",
+                    system_prompt=self._system_prompt,
+                    messages=list(agent_messages),
+                    raw_response=result.content if result.content else None,
+                    parsed_response=data,
+                    success=result.success,
+                    error=result.error,
+                    duration_seconds=result.duration_seconds,
+                )
+
             if not result.success or data is None:
                 logger.error("[FixAgent] LLM call failed: %s", result.error)
                 break
@@ -134,6 +149,16 @@ class FixAgent:
                 answer = user_agent.respond(question)
                 logger.info("[FixAgent] user_agent answered: %s", answer)
 
+                if self._pipeline_logger:
+                    self._pipeline_logger.log_tool_call(
+                        agent="FixAgent",
+                        step=f"turn_{turn}",
+                        tool="ask_question",
+                        input_data={"question": question},
+                        output_data=answer,
+                        success=True,
+                    )
+
                 conversation.append(ConversationTurn(role="FixAgent", content=question))
                 conversation.append(ConversationTurn(role="UserAgent", content=answer))
 
@@ -146,7 +171,6 @@ class FixAgent:
             elif step.action == "done":
                 fix_sql = (step.fix_sql or "").strip() or _FALLBACK_SQL
                 is_fallback = (fix_sql == _FALLBACK_SQL)
-                confidence = step.confidence if step.confidence is not None else 0.0
                 reasoning = (step.reasoning or "").strip()
 
                 if is_fallback:
@@ -156,14 +180,13 @@ class FixAgent:
                     )
                 else:
                     logger.info(
-                        "[FixAgent] concluded after %d question(s). confidence=%.2f  fix_sql=%s",
-                        questions_asked, confidence, fix_sql,
+                        "[FixAgent] concluded after %d question(s).  fix_sql=%s",
+                        questions_asked, fix_sql,
                     )
 
                 return FixResult(
                     record_id=self._record.id,
                     fix_sql=fix_sql,
-                    confidence=confidence,
                     reasoning=reasoning,
                     questions_asked=questions_asked,
                     conversation=conversation,
@@ -181,7 +204,6 @@ class FixAgent:
         return FixResult(
             record_id=self._record.id,
             fix_sql=_FALLBACK_SQL,
-            confidence=0.0,
             reasoning="Agent reached maximum turns without producing a fix.",
             questions_asked=questions_asked,
             conversation=conversation,
