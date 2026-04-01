@@ -728,32 +728,60 @@ class Pipeline:
         self.rng.shuffle(samples)
         if self.sample_count > 0:
             samples = samples[: self.sample_count]
-        self.stats.total = len(samples)
+
+        # ── Resume: skip already-processed samples ────────────────────────
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        processed_keys = self._load_processed_keys()
+        existing_records = self._load_existing_records()
+        if processed_keys:
+            logger.info(
+                "Resume mode: %d samples already processed, skipping them",
+                len(processed_keys),
+            )
+        samples_to_run = [
+            s for s in samples if (s.db_id, s.question) not in processed_keys
+        ]
+        skipped_count = len(samples) - len(samples_to_run)
+        if skipped_count:
+            logger.info(
+                "Skipped %d already-processed samples; %d remaining to process",
+                skipped_count, len(samples_to_run),
+            )
+
+        self.stats.total = len(samples_to_run)
+
+        # Set record ID counter beyond any existing records
+        if existing_records:
+            self._next_record_id = max(r.id for r in existing_records) + 1
+        else:
+            self._next_record_id = 1
 
         logger.info(
             "Pipeline config: samples=%d, delete_prob=%.2f, max_targets=%d, "
             "max_retries=%d, seed=%d, model=%s",
-            len(samples), self.delete_prob, self.max_targets,
+            len(samples_to_run), self.delete_prob, self.max_targets,
             self.max_retries, self.seed,
             self.llm.model if self.llm else "N/A",
         )
 
         self.db.cleanup_all_sandboxes()
 
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.sample_logger = SampleLogger(self.output_dir)
 
-        results: list[DatasetRecord] = []
-        self._next_record_id = 1  # reset counter for this run
+        results: list[DatasetRecord] = list(existing_records)
+
+        # Open dataset.jsonl in append mode for incremental writes
+        dataset_jsonl_path = self.output_dir / "dataset.jsonl"
+        dataset_fh = open(dataset_jsonl_path, "a", encoding="utf-8")
 
         try:
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {
                     executor.submit(self.process_sample, sample, idx): idx
-                    for idx, sample in enumerate(samples)
+                    for idx, sample in enumerate(samples_to_run)
                 }
                 for future in tqdm(
-                    as_completed(futures), total=len(samples), desc="Processing samples"
+                    as_completed(futures), total=len(samples_to_run), desc="Processing samples"
                 ):
                     try:
                         record = future.result()
@@ -761,8 +789,15 @@ class Pipeline:
                         logger.error("Unexpected worker error: %s", exc)
                         record = None
                     if record is not None:
+                        with self._log_lock:
+                            dataset_fh.write(
+                                json.dumps(record.model_dump(), ensure_ascii=False, default=str)
+                                + "\n"
+                            )
+                            dataset_fh.flush()
                         results.append(record)
         finally:
+            dataset_fh.close()
             self.db.cleanup_all_sandboxes()
             self.sample_logger.consolidate()
 
@@ -787,6 +822,45 @@ class Pipeline:
         self._save_stats(summary)
         return results
 
+    # ── Resume helpers ──────────────────────────────────────────────────────
+
+    def _load_processed_keys(self) -> set[tuple[str, str]]:
+        """Return (db_id, question) pairs for all already-processed samples."""
+        processed: set[tuple[str, str]] = set()
+        for fname in ("sample_logs.jsonl", "failed_samples.jsonl"):
+            path = self.output_dir / fname
+            if not path.exists():
+                continue
+            with open(path, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                        key = (entry.get("db_id", ""), entry.get("question", ""))
+                        processed.add(key)
+                    except json.JSONDecodeError:
+                        pass
+        return processed
+
+    def _load_existing_records(self) -> list[DatasetRecord]:
+        """Load DatasetRecords previously written to dataset.jsonl."""
+        path = self.output_dir / "dataset.jsonl"
+        records: list[DatasetRecord] = []
+        if not path.exists():
+            return records
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(DatasetRecord(**json.loads(line)))
+                except Exception as exc:
+                    logger.warning("Skipping corrupt dataset.jsonl entry: %s", exc)
+        return records
+
     # ── Output ─────────────────────────────────────────────────────────────
 
     def _save_results(self, results: list[DatasetRecord]) -> None:
@@ -800,11 +874,9 @@ class Pipeline:
             )
         logger.info("Saved %d records → %s", len(results), json_path)
 
+        # dataset.jsonl is written incrementally during run(); just log its path.
         jsonl_path = self.output_dir / "dataset.jsonl"
-        with open(jsonl_path, "w", encoding="utf-8") as f:
-            for r in results:
-                f.write(json.dumps(r.model_dump(), ensure_ascii=False, default=str) + "\n")
-        logger.info("Saved %d records → %s", len(results), jsonl_path)
+        logger.info("Incremental records written to → %s", jsonl_path)
 
     def _save_stats(self, summary: dict[str, Any]) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
