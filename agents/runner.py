@@ -25,7 +25,9 @@ from database_utils import (
     format_diff_as_text,
     get_db_path,
 )
-from evaluator import evaluate
+import json
+
+from evaluator import evaluate, quick_fix_check
 from explanation_agent import ExplanationAgent
 from fix_agent import FixAgent
 from llm_client import GeminiClient, LLMClient
@@ -49,6 +51,10 @@ def run_record(
     max_explanation_turns: int | None = None,
     max_fix_turns: int | None = None,
     question_penalty: float | None = None,
+    max_fix_retries: int | None = None,
+    explanation_query_penalty: float | None = None,
+    fix_query_penalty: float | None = None,
+    ask_question_penalty: float | None = None,
 ) -> tuple[RunResult, SampleLog]:
     """
     Run the full three-agent pipeline for one dataset record.
@@ -117,6 +123,8 @@ def run_record(
         timestamp_start=timestamp_start,
     )
 
+    _max_fix_retries = max_fix_retries if max_fix_retries is not None else config.MAX_FIX_RETRIES
+
     try:
         # ── Step 1: ExplanationAgent ─────────────────────────────────────────
         explanation_agent = ExplanationAgent(
@@ -128,25 +136,66 @@ def run_record(
         )
         explanation = explanation_agent.run()
         logger.info(
-            "ExplanationAgent done  turns=%d  root_cause=%s",
-            explanation.turns_used, explanation.root_cause,
+            "ExplanationAgent done  turns=%d  query_turns=%d  alteration_type=%s",
+            explanation.turns_used, explanation.query_turns, explanation.alteration_type,
         )
         sample_log.explanation_result = explanation.model_dump()
 
         # ── Step 2: FixAgent ──────────────────────────────────────────────────
+        _effective_question_penalty = ask_question_penalty if ask_question_penalty is not None else question_penalty
         fix_agent = FixAgent(
             record=record,
             explanation=explanation,
             llm=fix_llm,
             max_turns=max_fix_turns,
-            question_penalty=question_penalty,
+            question_penalty=_effective_question_penalty,
             pipeline_logger=pipeline_logger,
+            altered_db_path=sandbox_path,
         )
         fix = fix_agent.run(user_agent)
         logger.info(
-            "FixAgent done  questions_asked=%d  confidence=%.2f  fix_sql=%s",
-            fix.questions_asked, fix.confidence, fix.fix_sql,
+            "FixAgent done  questions_asked=%d  query_turns=%d  fix_sql=%s",
+            fix.questions_asked, fix.query_turns, fix.fix_sql,
         )
+
+        # ── Retry if first fix fails the gold check ───────────────────────────
+        if _max_fix_retries > 0 and not fix.is_fallback:
+            gold_pre, _, actual_after_fix, _ = quick_fix_check(
+                record=record,
+                fix_result=fix,
+                sandbox_dir=sandbox_dir,
+                db_base_dir=db_base_dir,
+            )
+            if gold_pre == 0.0:
+                logger.info(
+                    "FixAgent initial fix failed gold check for record=%d — attempting retry 1/%d",
+                    record.id, _max_fix_retries,
+                )
+                retry_context = (
+                    "Your previous fix SQL was INCORRECT.\n\n"
+                    f"Previous fix SQL:\n{fix.fix_sql}\n\n"
+                    f"After applying it, running the gold SQL returned:\n"
+                    f"{json.dumps(actual_after_fix, default=str)}\n\n"
+                    f"But the expected result is:\n"
+                    f"{json.dumps(record.gold_result, default=str)}\n\n"
+                    "Please produce a new, corrected fix SQL."
+                )
+                fix_agent_retry = FixAgent(
+                    record=record,
+                    explanation=explanation,
+                    llm=fix_llm,
+                    max_turns=max_fix_turns,
+                    question_penalty=_effective_question_penalty,
+                    pipeline_logger=pipeline_logger,
+                    altered_db_path=sandbox_path,
+                )
+                fix_retry = fix_agent_retry.run(user_agent, retry_context=retry_context)
+                fix = fix_retry.model_copy(update={"retry_count": 1})
+                logger.info(
+                    "FixAgent retry complete for record=%d  fix_sql=%s",
+                    record.id, fix.fix_sql,
+                )
+
         sample_log.fix_result = fix.model_dump()
 
         # ── Step 3: Evaluator ─────────────────────────────────────────────────
@@ -156,6 +205,9 @@ def run_record(
             explanation_result=explanation,
             judge_llm=judge_llm,
             question_penalty=question_penalty,
+            explanation_query_penalty=explanation_query_penalty,
+            fix_query_penalty=fix_query_penalty,
+            ask_question_penalty=ask_question_penalty,
             sandbox_dir=sandbox_dir,
             db_base_dir=db_base_dir,
             pipeline_logger=pipeline_logger,
@@ -180,9 +232,13 @@ def run_record(
         sample_log.events = [asdict(e) for e in pipeline_logger.events]
 
     logger.info(
-        "Record id=%d done in %.1fs — fix_score=%.1f  explanation_score=%.2f  final_score=%.4f",
+        "Record id=%d done in %.1fs — gold_result_score=%.1f  full_restore_score=%.1f  "
+        "alteration_type_score=%.1f  explanation_score=%.2f  "
+        "tool_penalty=%.4f  final_score=%.4f  retry_count=%d",
         record.id, elapsed,
-        evaluation.fix_score, evaluation.explanation_score, evaluation.final_score,
+        evaluation.gold_result_score, evaluation.full_restore_score,
+        evaluation.alteration_type_score, evaluation.explanation_score,
+        evaluation.tool_penalty, evaluation.final_score, fix.retry_count,
     )
 
     run_result = RunResult(

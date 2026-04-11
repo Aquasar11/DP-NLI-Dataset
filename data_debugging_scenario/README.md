@@ -139,19 +139,40 @@ python main.py --samples 0
 ```
 python main.py --help
 
-  --model MODEL          OpenAI model (default: gpt-4o, configurable to any model)
-  --api-key API_KEY      OpenAI API key (or set OPENAI_API_KEY env var)
-  --base-url BASE_URL    OpenAI-compatible API base URL
-  --temperature TEMP     LLM temperature (default: 0.3)
-  --samples N            Number of samples to process, 0 = all (default: 100)
-  --delete-prob P        Probability of row deletion vs column modification (default: 0.5)
-  --max-targets N        Max result records to alter per sample (default: 1)
-  --max-retries N        Max LLM retries on validation failure (default: 3)
-  --seed N               Random seed for reproducibility (default: 42)
-  --output-dir DIR       Output directory (default: output/)
-  --train-json PATH      Path to BIRD train.json
-  --db-dir DIR           Path to BIRD train_databases/
-  --log-level LEVEL      DEBUG, INFO, WARNING, or ERROR (default: INFO)
+  --provider {openai,gemini}   LLM provider (default: openai)
+  --model MODEL                Model name (overrides OPENAI_MODEL / GEMINI_MODEL env var)
+  --api-key API_KEY            API key (or set OPENAI_API_KEY / GEMINI_API_KEY env var)
+  --base-url BASE_URL          OpenAI-compatible API base URL
+  --temperature TEMP           LLM temperature (default: 0.3)
+  --dataset {bird_train,bird_dev,spider_train,spider_test}
+                               Source dataset — auto-sets --train-json and --db-dir defaults
+                               (default: bird_train)
+  --samples N                  Number of samples to process, 0 = all (default: 100)
+  --delete-prob P              Probability of row deletion vs column modification (default: 0.5)
+  --max-targets N              Max result records to alter per sample (default: 1)
+  --max-retries N              Max LLM retries on validation failure (default: 3)
+  --seed N                     Random seed for reproducibility (default: 42)
+  --workers N                  Number of parallel worker threads (default: 10)
+  --output-dir DIR             Output directory (default: output/)
+  --train-json PATH            Path to dataset JSON (overrides --dataset default)
+  --db-dir DIR                 Path to SQLite database folder (overrides --dataset default)
+  --log-level LEVEL            DEBUG, INFO, WARNING, or ERROR (default: INFO)
+```
+
+### Dataset Examples
+
+```bash
+# BIRD train (default)
+python main.py --samples 100
+
+# BIRD dev (requires dev_databases.zip extracted to data/bird_dev/database/)
+python main.py --dataset bird_dev --samples 50
+
+# Spider train
+python main.py --dataset spider_train --samples 100
+
+# Spider test
+python main.py --dataset spider_test --samples 50
 ```
 
 ## Pipeline Details
@@ -242,9 +263,24 @@ Same records, one JSON object per line.
 }
 ```
 
-## Seed Dataset
+## Supported Datasets
 
-This project uses the **BIRD-Bench** training set as the seed dataset:
+The pipeline supports four source datasets selectable via `--dataset`:
+
+| Dataset | Flag | JSON format | Key field |
+|---|---|---|---|
+| **BIRD-Bench train** (default) | `bird_train` | `train.json` | `SQL` |
+| **BIRD-Bench dev** | `bird_dev` | `dev.json` | `SQL` |
+| **Spider train** | `spider_train` | `train_spider.json` | `query` |
+| **Spider test** | `spider_test` | `test.json` | `query` |
+
+Spider samples are automatically normalized to the BIRD format (`query → SQL`, `evidence = ""`). All downstream pipeline logic is identical regardless of the source dataset.
+
+> **BIRD dev databases**: The `database/` folder must be extracted from `dev_databases.zip` before use. If the directory does not exist, the pipeline exits with a clear error.
+
+### Seed Dataset (BIRD train default)
+
+The default BIRD-Bench training set:
 - **~9,428 samples** across **69 SQLite databases**
 - Each sample has: `db_id`, `question`, `evidence`, `SQL`
 - Databases span domains: movies, restaurants, sports, finance, healthcare, etc.
@@ -260,9 +296,22 @@ All defaults are set in `config.py` and can be overridden via CLI args or enviro
 | API key | — | `OPENAI_API_KEY` | `--api-key` |
 | API base URL | (OpenAI default) | `OPENAI_BASE_URL` | `--base-url` |
 | Temperature | `0.3` | `OPENAI_TEMPERATURE` | `--temperature` |
+| Dataset | `bird_train` | — | `--dataset` |
 | Sample count | `100` | — | `--samples` |
 | Delete probability | `0.5` | — | `--delete-prob` |
 | Max target records | `1` | — | `--max-targets` |
 | Max retries | `3` | — | `--max-retries` |
 | Random seed | `42` | — | `--seed` |
+| Workers | `10` | — | `--workers` |
 | Log level | `INFO` | `LOG_LEVEL` | `--log-level` |
+
+### Dataset Path Defaults
+
+Default paths are set in `config.py` relative to the project root and can be overridden via environment variables:
+
+| Dataset | JSON path | DB directory | Env var (db dir) |
+|---|---|---|---|
+| `bird_train` | `data/bird/train/train.json` | `data/bird/train/train_databases/` | `BIRD_TRAIN_DB_DIR` |
+| `bird_dev` | `data/bird_dev/dev.json` | `data/bird_dev/database/` | `BIRD_DEV_DB_DIR` |
+| `spider_train` | `data/spider_data/train_spider.json` | `data/spider_data/database/` | `SPIDER_TRAIN_DB_DIR` |
+| `spider_test` | `data/spider_data/test.json` | `data/spider_data/test_database/` | `SPIDER_TEST_DB_DIR` |

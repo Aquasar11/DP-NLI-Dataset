@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Union
 
-from database_utils import get_ddl
+from database_utils import get_ddl, run_select_query
 from llm_client import GeminiClient, LLMClient
 from models import (
     ConversationTurn,
@@ -50,25 +51,30 @@ class FixAgent:
         max_turns: int | None = None,
         question_penalty: float | None = None,
         pipeline_logger: PipelineLogger | None = None,
+        altered_db_path: Path | None = None,
     ) -> None:
         self._record = record
         self._explanation = explanation
         self._llm = llm
         self._max_turns = max_turns if max_turns is not None else config.MAX_FIX_TURNS
         self._question_penalty = (
-            question_penalty if question_penalty is not None else config.QUESTION_PENALTY
+            question_penalty if question_penalty is not None else config.ASK_QUESTION_PENALTY
         )
         self._pipeline_logger = pipeline_logger
+        self._altered_db_path = altered_db_path
 
         ddl = self._get_ddl(record)
         self._system_prompt = FIX_AGENT_SYSTEM_PROMPT.format_map(
             {
                 "db_id": record.db_id,
+                "question": record.question,
+                "follow_up_question": record.follow_up_question,
                 "gold_sql": record.gold_sql,
                 "altered_result": json.dumps(record.altered_result, default=str),
                 "explanation": explanation.explanation,
-                "root_cause": explanation.root_cause,
+                "alteration_type": explanation.alteration_type,
                 "question_penalty": self._question_penalty,
+                "fix_query_penalty": config.FIX_QUERY_PENALTY,
                 "ddl": ddl,
             }
         )
@@ -84,24 +90,35 @@ class FixAgent:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def run(self, user_agent: UserAgent) -> FixResult:
+    def run(
+        self,
+        user_agent: UserAgent,
+        retry_context: str | None = None,
+    ) -> FixResult:
         """
         Run the fix generation loop.
 
         Args:
             user_agent: The oracle agent that can answer clarifying questions.
+            retry_context: Optional feedback from a previous failed attempt.
+                If provided, it is injected as the first user message so the
+                agent knows what went wrong.
 
         Returns:
             :class:`FixResult` with the fix SQL, confidence, and conversation log.
         """
         logger.info(
-            "[FixAgent] starting for record=%d  db=%s",
-            self._record.id, self._record.db_id,
+            "[FixAgent] starting for record=%d  db=%s  retry=%s",
+            self._record.id, self._record.db_id, retry_context is not None,
         )
 
         conversation: list[ConversationTurn] = []
         agent_messages: list[dict[str, str]] = []
         questions_asked = 0
+        query_turns = 0
+
+        if retry_context:
+            agent_messages.append({"role": "user", "content": retry_context})
 
         for turn in range(1, self._max_turns + 1):
             logger.debug(
@@ -138,7 +155,48 @@ class FixAgent:
                 logger.warning("[FixAgent] could not parse step: %s — raw: %s", exc, data)
                 break
 
-            if step.action == "ask_question" and step.question:
+            if step.action == "run_query" and step.sql:
+                query_turns += 1
+                sql = step.sql.strip()
+                first_stmt = next((s.strip() for s in sql.split(";") if s.strip()), sql)
+                logger.info("[FixAgent] running query (turn %d): %s", turn, first_stmt)
+
+                query_success = True
+                query_error = None
+                if self._altered_db_path:
+                    try:
+                        rows = run_select_query(self._altered_db_path, first_stmt, max_rows=500)
+                        tool_result = (
+                            f"Query succeeded ({len(rows)} row(s) shown, results capped at 500): "
+                            + json.dumps(rows[:20], default=str)
+                        )
+                    except Exception as exc:
+                        query_success = False
+                        query_error = str(exc)
+                        tool_result = f"Query failed: {exc}"
+                        logger.warning("[FixAgent] query error: %s", exc)
+                else:
+                    tool_result = "Query tool unavailable: no database path provided."
+                    query_success = False
+
+                if self._pipeline_logger:
+                    self._pipeline_logger.log_tool_call(
+                        agent="FixAgent",
+                        step=f"turn_{turn}",
+                        tool="run_query",
+                        input_data={"sql": first_stmt},
+                        output_data=tool_result,
+                        success=query_success,
+                        error=query_error,
+                    )
+
+                agent_messages.append({"role": "assistant", "content": json.dumps(data)})
+                agent_messages.append({
+                    "role": "user",
+                    "content": f"Query result: {tool_result}",
+                })
+
+            elif step.action == "ask_question" and step.question:
                 questions_asked += 1
                 question = step.question.strip()
                 logger.info(
@@ -189,6 +247,7 @@ class FixAgent:
                     fix_sql=fix_sql,
                     reasoning=reasoning,
                     questions_asked=questions_asked,
+                    query_turns=query_turns,
                     conversation=conversation,
                     is_fallback=is_fallback,
                 )
@@ -206,6 +265,7 @@ class FixAgent:
             fix_sql=_FALLBACK_SQL,
             reasoning="Agent reached maximum turns without producing a fix.",
             questions_asked=questions_asked,
+            query_turns=query_turns,
             conversation=conversation,
             is_fallback=True,
         )

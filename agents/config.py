@@ -44,24 +44,48 @@ GOOGLE_CLOUD_LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 # ── Agent settings ──────────────────────────────────────────────────────────
 # Maximum Q&A turns the ExplanationAgent may use
 MAX_EXPLANATION_TURNS: int = int(os.getenv("MAX_EXPLANATION_TURNS", "6"))
-# Maximum Q&A turns the FixAgent may use (each incurs a score penalty)
+# Maximum Q&A turns the FixAgent may use (each tool call incurs a score penalty)
 MAX_FIX_TURNS: int = int(os.getenv("MAX_FIX_TURNS", "4"))
-# Score penalty subtracted for every question asked by the FixAgent
-QUESTION_PENALTY: float = float(os.getenv("QUESTION_PENALTY", "0.05"))
+# Number of retries for the FixAgent when the gold check fails (0 = no retry)
+MAX_FIX_RETRIES: int = int(os.getenv("MAX_FIX_RETRIES", "1"))
+
+# ── Per-tool score penalties ─────────────────────────────────────────────────
+# Penalty per run_query call by the ExplanationAgent
+EXPLANATION_QUERY_PENALTY: float = float(os.getenv("EXPLANATION_QUERY_PENALTY", "0.01"))
+# Penalty per run_query call by the FixAgent
+FIX_QUERY_PENALTY: float = float(os.getenv("FIX_QUERY_PENALTY", "0.02"))
+# Penalty per ask_question call by the FixAgent
+# Falls back to legacy QUESTION_PENALTY env var for backward compatibility
+ASK_QUESTION_PENALTY: float = float(
+    os.getenv("ASK_QUESTION_PENALTY", os.getenv("QUESTION_PENALTY", "0.05"))
+)
+# Deprecated alias — kept so existing code reading config.QUESTION_PENALTY still works
+QUESTION_PENALTY: float = ASK_QUESTION_PENALTY
 
 # ── Paths ───────────────────────────────────────────────────────────────────
-DB_BASE_DIR: Path = Path(
+_DATA_ROOT: Path = PROJECT_ROOT.parent / "data"
+
+# Dataset-specific DB directory presets (used by --dataset-preset in main.py)
+BIRD_TRAIN_DB_DIR: Path = Path(
     os.getenv(
-        "DB_BASE_DIR",
-        str(
-            PROJECT_ROOT.parent
-            / "data_debugging_scenario"
-            / "data"
-            / "train"
-            / "train_databases"
-        ),
+        "BIRD_TRAIN_DB_DIR",
+        str(PROJECT_ROOT.parent / "data_debugging_scenario" / "data" / "train" / "train_databases"),
     )
 )
+BIRD_DEV_DB_DIR: Path = Path(
+    os.getenv("BIRD_DEV_DB_DIR", str(_DATA_ROOT / "bird_dev" / "dev_databases"))
+)
+SPIDER_TRAIN_DB_DIR: Path = Path(
+    os.getenv("SPIDER_TRAIN_DB_DIR", str(_DATA_ROOT / "spider_data" / "database"))
+)
+SPIDER_DEV_DB_DIR: Path = Path(
+    os.getenv("SPIDER_DEV_DB_DIR", str(_DATA_ROOT / "spider_data" / "database"))
+)
+SPIDER_TEST_DB_DIR: Path = Path(
+    os.getenv("SPIDER_TEST_DB_DIR", str(_DATA_ROOT / "spider_data" / "test_database"))
+)
+
+DB_BASE_DIR: Path = Path(os.getenv("DB_BASE_DIR", str(BIRD_TRAIN_DB_DIR)))
 
 DATASET_PATH: Path = Path(
     os.getenv(

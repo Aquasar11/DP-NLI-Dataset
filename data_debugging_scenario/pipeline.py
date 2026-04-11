@@ -35,6 +35,7 @@ from models import (
     AlterationType,
     BirdSample,
     DatasetRecord,
+    SpiderSample,
     ValidationResult,
 )
 from prompts import (
@@ -129,6 +130,38 @@ class PipelineStats:
         }
 
 
+_DATASET_JSON_PATHS: dict[str, Path] = {}
+_DATASET_DB_DIRS: dict[str, tuple[Path, Path]] = {}
+
+
+def _dataset_json_path(dataset: str) -> Path:
+    """Return the samples JSON path for a named dataset."""
+    mapping = {
+        "bird_train": config.BIRD_TRAIN_JSON,
+        "bird_dev": config.BIRD_DEV_JSON,
+        "spider_train": config.SPIDER_TRAIN_JSON,
+        "spider_dev": config.SPIDER_DEV_JSON,
+        "spider_test": config.SPIDER_TEST_JSON,
+    }
+    if dataset not in mapping:
+        raise ValueError(f"Unknown dataset: {dataset!r}. Choose from: {list(mapping)}")
+    return mapping[dataset]
+
+
+def _dataset_paths(dataset: str) -> tuple[Path, Path]:
+    """Return ``(db_dir, tables_json_path)`` for a named dataset."""
+    mapping = {
+        "bird_train": (config.BIRD_DB_DIR, config.BIRD_TABLES_JSON),
+        "bird_dev": (config.BIRD_DEV_DB_DIR, config.BIRD_DEV_TABLES_JSON),
+        "spider_train": (config.SPIDER_DB_DIR, config.SPIDER_TABLES_JSON),
+        "spider_dev": (config.SPIDER_DEV_DB_DIR, config.SPIDER_DEV_TABLES_JSON),
+        "spider_test": (config.SPIDER_TEST_DB_DIR, config.SPIDER_TEST_TABLES_JSON),
+    }
+    if dataset not in mapping:
+        raise ValueError(f"Unknown dataset: {dataset!r}. Choose from: {list(mapping)}")
+    return mapping[dataset]
+
+
 class Pipeline:
     """Orchestrates the data debugging dataset generation."""
 
@@ -137,6 +170,7 @@ class Pipeline:
         *,
         db_manager: DatabaseManager | None = None,
         llm_client: LLMClient | None = None,
+        dataset: str = "bird_train",
         sample_count: int | None = None,
         delete_probability: float | None = None,
         max_target_records: int | None = None,
@@ -145,7 +179,12 @@ class Pipeline:
         output_dir: Path | None = None,
         max_workers: int | None = None,
     ) -> None:
-        self.db = db_manager or DatabaseManager()
+        self.dataset = dataset
+        if db_manager is not None:
+            self.db = db_manager
+        else:
+            db_dir, tables_json = _dataset_paths(dataset)
+            self.db = DatabaseManager(db_dir=db_dir, tables_json_path=tables_json)
         self.llm = llm_client
         self.sample_count = sample_count if sample_count is not None else config.SAMPLE_COUNT
         self.delete_prob = (
@@ -178,12 +217,27 @@ class Pipeline:
     # ── Data Loading ───────────────────────────────────────────────────────
 
     def load_samples(self, path: Path | None = None) -> list[BirdSample]:
-        """Load BIRD training samples from train.json."""
-        path = path or config.BIRD_TRAIN_JSON
-        logger.info("Loading samples from %s", path)
+        """
+        Load dataset samples, normalizing all formats to :class:`BirdSample`.
+
+        Supports ``bird_train``, ``bird_dev``, ``spider_train``, ``spider_test``
+        (controlled by ``self.dataset``). An explicit *path* overrides the
+        dataset-derived default.
+        """
+        if path is None:
+            path = _dataset_json_path(self.dataset)
+        logger.info("Loading samples from %s (dataset=%s)", path, self.dataset)
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        samples = [BirdSample(**entry) for entry in data]
+
+        if self.dataset in ("spider_train", "spider_dev", "spider_test"):
+            samples: list[BirdSample] = [
+                SpiderSample(**entry).to_bird_sample() for entry in data
+            ]
+        else:
+            # bird_train and bird_dev share the same JSON schema as BirdSample
+            samples = [BirdSample(**entry) for entry in data]
+
         logger.info("Loaded %d samples total", len(samples))
         return samples
 

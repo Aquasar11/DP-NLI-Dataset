@@ -74,6 +74,18 @@ def parse_args() -> argparse.Namespace:
         help="LLM temperature",
     )
 
+    # ── Dataset selection ─────────────────────────────────────────────────
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="bird_train",
+        choices=["bird_train", "bird_dev", "spider_train", "spider_dev", "spider_test"],
+        help=(
+            "Dataset to process. Automatically sets --train-json and --db-dir defaults. "
+            "Explicit --train-json or --db-dir flags override these defaults."
+        ),
+    )
+
     # ── Pipeline settings ─────────────────────────────────────────────────
     parser.add_argument(
         "--samples",
@@ -165,16 +177,42 @@ def main() -> None:
     logger.info("Data Debugging Dataset Generator")
     logger.info("=" * 60)
 
-    # ── Override config paths if provided ──────────────────────────────────
-    if args.train_json != str(config.BIRD_TRAIN_JSON):
-        config.BIRD_TRAIN_JSON = Path(args.train_json)
-    if args.db_dir != str(config.BIRD_DB_DIR):
-        config.BIRD_DB_DIR = Path(args.db_dir)
+    # ── Resolve dataset-specific path defaults ─────────────────────────────
+    from pipeline import _dataset_paths, _dataset_json_path  # noqa: E402
+
+    _DATASET_DEFAULTS = {
+        "bird_train":   (str(config.BIRD_TRAIN_JSON),   str(config.BIRD_DB_DIR),        config.BIRD_TABLES_JSON),
+        "bird_dev":     (str(config.BIRD_DEV_JSON),     str(config.BIRD_DEV_DB_DIR),     config.BIRD_DEV_TABLES_JSON),
+        "spider_train": (str(config.SPIDER_TRAIN_JSON), str(config.SPIDER_DB_DIR),       config.SPIDER_TABLES_JSON),
+        "spider_dev":   (str(config.SPIDER_DEV_JSON),   str(config.SPIDER_DEV_DB_DIR),   config.SPIDER_DEV_TABLES_JSON),
+        "spider_test":  (str(config.SPIDER_TEST_JSON),  str(config.SPIDER_TEST_DB_DIR),  config.SPIDER_TEST_TABLES_JSON),
+    }
+    dataset = args.dataset
+    default_train_json, default_db_dir, tables_json_path = _DATASET_DEFAULTS[dataset]
+
+    # Use explicitly provided CLI values; otherwise fall back to dataset defaults
+    train_json = args.train_json if args.train_json != str(config.BIRD_TRAIN_JSON) else default_train_json
+    db_dir = args.db_dir if args.db_dir != str(config.BIRD_DB_DIR) else default_db_dir
+
+    # Validate database directory exists
+    db_dir_path = Path(db_dir)
+    if not db_dir_path.exists():
+        logger.error(
+            "Database directory not found: %s\n"
+            "For 'bird_dev', extract dev_databases.zip to data/bird_dev/dev_databases/ first.",
+            db_dir_path,
+        )
+        sys.exit(1)
+
+    logger.info("Dataset:    %s", dataset)
+    logger.info("Train JSON: %s", train_json)
+    logger.info("DB dir:     %s", db_dir)
 
     # ── Initialize components ─────────────────────────────────────────────
     db_manager = DatabaseManager(
-        db_dir=Path(args.db_dir),
+        db_dir=db_dir_path,
         sandbox_dir=Path(args.output_dir).parent / "sandbox",
+        tables_json_path=tables_json_path,
     )
 
     if args.provider == "gemini":
@@ -195,6 +233,7 @@ def main() -> None:
     pipeline = Pipeline(
         db_manager=db_manager,
         llm_client=llm_client,
+        dataset=dataset,
         sample_count=args.samples,
         delete_probability=args.delete_prob,
         max_target_records=args.max_targets,

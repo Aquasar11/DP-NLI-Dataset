@@ -17,6 +17,30 @@ load_dotenv(_DOTENV_PATH)
 BIRD_TRAIN_JSON = PROJECT_ROOT / "data" / "bird" / "train" / "train.json"
 BIRD_TABLES_JSON = PROJECT_ROOT / "data" / "bird" / "train" / "train_tables.json"
 BIRD_DB_DIR = PROJECT_ROOT / "data" / "bird" / "train" / "train_databases"
+
+_DATA_ROOT = PROJECT_ROOT.parent / "data"
+
+# ── BIRD dev ───────────────────────────────────────────────────────────────────
+# NOTE: dev_databases.zip must be extracted to data/bird_dev/dev_databases/ first.
+BIRD_DEV_JSON = _DATA_ROOT / "bird_dev" / "dev.json"
+BIRD_DEV_TABLES_JSON = _DATA_ROOT / "bird_dev" / "dev_tables.json"
+BIRD_DEV_DB_DIR = _DATA_ROOT / "bird_dev" / "dev_databases"
+
+# ── Spider train ───────────────────────────────────────────────────────────────
+SPIDER_TRAIN_JSON = _DATA_ROOT / "spider_data" / "train_spider.json"
+SPIDER_TABLES_JSON = _DATA_ROOT / "spider_data" / "tables.json"
+SPIDER_DB_DIR = _DATA_ROOT / "spider_data" / "database"
+
+# ── Spider dev ─────────────────────────────────────────────────────────────────
+SPIDER_DEV_JSON = _DATA_ROOT / "spider_data" / "dev.json"
+SPIDER_DEV_TABLES_JSON = _DATA_ROOT / "spider_data" / "tables.json"
+SPIDER_DEV_DB_DIR = _DATA_ROOT / "spider_data" / "database"
+
+# ── Spider test ────────────────────────────────────────────────────────────────
+SPIDER_TEST_JSON = _DATA_ROOT / "spider_data" / "test.json"
+SPIDER_TEST_TABLES_JSON = _DATA_ROOT / "spider_data" / "test_tables.json"
+SPIDER_TEST_DB_DIR = _DATA_ROOT / "spider_data" / "test_database"
+
 OUTPUT_DIR = PROJECT_ROOT / "output"
 SANDBOX_DIR = PROJECT_ROOT / "sandbox"
 
@@ -50,4 +74,4 @@ MAX_TARGET_RECORDS: int = 2      # max number of result records to alter per sam
 MAX_RETRIES: int = 3             # retry LLM on validation failure
 
 # ── Logging ────────────────────────────────────────────────────────────────────
-LOG_LEVEL: str = os.getenv("LOG_LEVEL", "DEBUG")
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

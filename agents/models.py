@@ -48,9 +48,9 @@ class ExplanationAgentStep(BaseModel):
         None,
         description="Full explanation of what changed in the data (required when action='done')",
     )
-    root_cause: str | None = Field(
+    alteration_type: str | None = Field(
         None,
-        description="Concise one-sentence root cause (required when action='done')",
+        description="Either 'deletion' or 'modification' (required when action='done')",
     )
 
 
@@ -58,7 +58,15 @@ class FixAgentStep(BaseModel):
     """One reasoning step produced by the FixAgent LLM."""
 
     action: str = Field(
-        description="'ask_question' to gather more info (incurs penalty), or 'done' to submit"
+        description=(
+            "'run_query' to inspect the altered database directly (incurs penalty), "
+            "'ask_question' to gather more info from the database owner (incurs penalty), "
+            "or 'done' to submit the fix SQL"
+        )
+    )
+    sql: str | None = Field(
+        None,
+        description="SELECT query to run on the altered database (required when action='run_query')",
     )
     question: str | None = Field(
         None,
@@ -91,8 +99,9 @@ class ExplanationResult(BaseModel):
 
     record_id: int
     explanation: str
-    root_cause: str
+    alteration_type: str
     turns_used: int
+    query_turns: int = 0    # number of run_query calls made
     conversation: list[ConversationTurn]
     is_fallback: bool = False
 
@@ -104,6 +113,8 @@ class FixResult(BaseModel):
     fix_sql: str
     reasoning: str
     questions_asked: int
+    query_turns: int = 0    # number of run_query calls made
+    retry_count: int = 0    # how many retries were used (0 = first attempt succeeded/failed)
     conversation: list[ConversationTurn]
     is_fallback: bool = False
 
@@ -115,17 +126,24 @@ class EvaluationResult(BaseModel):
 
     record_id: int
     db_id: str
-    # Explanation quality (LLM-as-judge)
-    explanation_score: float        # 0.0–1.0 from judge LLM
+    # Explanation quality
+    alteration_type_score: float    # 0 or 1, systematic comparison of predicted vs actual type
+    explanation_score: float        # 0.0, 0.5, or 1.0 from LLM-as-judge
     explanation_reasoning: str      # judge's reasoning
-    # Fix correctness (relaxed evaluation)
-    fix_score: float                # 0.0 = fail, 1.0 = gold_result OK + no corruption, 1.5 = full restore
+    # Fix correctness
+    gold_result_score: float        # 0 or 1: does gold_sql return gold_result after fix?
+    full_restore_score: float       # 0 or 1: is DB fully restored to original?
     fix_description: str            # human-readable description of fix evaluation result
-    # Scoring
+    # Tool usage counts
     questions_asked: int
-    question_penalty: float         # total deduction (penalty × questions_asked)
-    base_score: float               # same as fix_score
-    final_score: float              # base_score − question_penalty, clamped to [0, 1]
+    explanation_query_turns: int = 0        # run_query calls by ExplanationAgent
+    fix_query_turns: int = 0                # run_query calls by FixAgent
+    # Penalty breakdown
+    tool_penalty_breakdown: dict = Field(default_factory=dict)
+    tool_penalty: float             # total deduction across all tool uses
+    question_penalty: float = 0.0  # backward-compat alias (equal to tool_penalty)
+    base_score: float               # same as gold_result_score
+    final_score: float              # max(0, gold_result_score - tool_penalty)
     error: str | None = None
 
 

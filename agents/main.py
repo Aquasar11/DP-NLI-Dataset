@@ -125,8 +125,32 @@ def parse_args() -> argparse.Namespace:
     pipeline_group.add_argument(
         "--question-penalty",
         type=float,
-        default=config.QUESTION_PENALTY,
-        help="Score penalty per question asked by the FixAgent",
+        default=config.ASK_QUESTION_PENALTY,
+        help="(Deprecated) Score penalty per ask_question call. Use --ask-question-penalty.",
+    )
+    pipeline_group.add_argument(
+        "--max-fix-retries",
+        type=int,
+        default=config.MAX_FIX_RETRIES,
+        help="Max retries for FixAgent when gold check fails (0 = no retry)",
+    )
+    pipeline_group.add_argument(
+        "--explanation-query-penalty",
+        type=float,
+        default=config.EXPLANATION_QUERY_PENALTY,
+        help="Score penalty per run_query call by the ExplanationAgent",
+    )
+    pipeline_group.add_argument(
+        "--fix-query-penalty",
+        type=float,
+        default=config.FIX_QUERY_PENALTY,
+        help="Score penalty per run_query call by the FixAgent",
+    )
+    pipeline_group.add_argument(
+        "--ask-question-penalty",
+        type=float,
+        default=config.ASK_QUESTION_PENALTY,
+        help="Score penalty per ask_question call by the FixAgent",
     )
 
     # ── Paths ─────────────────────────────────────────────────────────────
@@ -140,6 +164,23 @@ def parse_args() -> argparse.Namespace:
         "--db-dir",
         default=str(config.DB_BASE_DIR),
         help="Root directory containing per-database SQLite folders",
+    )
+
+    _DATASET_DB_DIRS = {
+        "bird_train":   str(config.BIRD_TRAIN_DB_DIR),
+        "bird_dev":     str(config.BIRD_DEV_DB_DIR),
+        "spider_train": str(config.SPIDER_TRAIN_DB_DIR),
+        "spider_dev":   str(config.SPIDER_DEV_DB_DIR),
+        "spider_test":  str(config.SPIDER_TEST_DB_DIR),
+    }
+    path_group.add_argument(
+        "--dataset-preset",
+        choices=list(_DATASET_DB_DIRS.keys()),
+        default=None,
+        help=(
+            "Shorthand to auto-set --db-dir for a known dataset. "
+            "Overridden by an explicit --db-dir if provided."
+        ),
     )
     path_group.add_argument(
         "--output-dir",
@@ -249,26 +290,45 @@ def _save_results(results: list[RunResult], output_dir: Path) -> tuple[dict, Pat
     evals = [r.evaluation for r in results]
     n = len(evals)
     if n:
-        avg_fix_score = sum(e.fix_score for e in evals) / n
+        avg_alteration_type_score = sum(e.alteration_type_score for e in evals) / n
         avg_explanation_score = sum(e.explanation_score for e in evals) / n
+        avg_gold_result_score = sum(e.gold_result_score for e in evals) / n
+        avg_full_restore_score = sum(e.full_restore_score for e in evals) / n
         avg_final_score = sum(e.final_score for e in evals) / n
         avg_questions = sum(e.questions_asked for e in evals) / n
+        avg_expl_query_turns = sum(e.explanation_query_turns for e in evals) / n
+        avg_fix_query_turns = sum(e.fix_query_turns for e in evals) / n
+        avg_tool_penalty = sum(e.tool_penalty for e in evals) / n
+        retried = sum(1 for r in results if r.fix.retry_count > 0)
 
         stats = {
             "total_records": n,
-            "avg_fix_score": round(avg_fix_score, 4),
+            "avg_alteration_type_score": round(avg_alteration_type_score, 4),
             "avg_explanation_score": round(avg_explanation_score, 4),
+            "avg_gold_result_score": round(avg_gold_result_score, 4),
+            "avg_full_restore_score": round(avg_full_restore_score, 4),
             "avg_final_score": round(avg_final_score, 4),
             "avg_questions_asked": round(avg_questions, 2),
+            "avg_explanation_query_turns": round(avg_expl_query_turns, 2),
+            "avg_fix_query_turns": round(avg_fix_query_turns, 2),
+            "avg_tool_penalty": round(avg_tool_penalty, 4),
+            "fix_retried_count": retried,
+            "alteration_type_score_distribution": {
+                "score_0": sum(1 for e in evals if e.alteration_type_score == 0.0),
+                "score_1": sum(1 for e in evals if e.alteration_type_score == 1.0),
+            },
             "explanation_score_distribution": {
                 "score_0.0": sum(1 for e in evals if e.explanation_score == 0.0),
                 "score_0.5": sum(1 for e in evals if e.explanation_score == 0.5),
                 "score_1.0": sum(1 for e in evals if e.explanation_score == 1.0),
             },
-            "fix_score_distribution": {
-                "score_0.0": sum(1 for e in evals if e.fix_score == 0.0),
-                "score_1.0": sum(1 for e in evals if e.fix_score == 1.0),
-                "score_1.5": sum(1 for e in evals if e.fix_score == 1.5),
+            "gold_result_score_distribution": {
+                "score_0": sum(1 for e in evals if e.gold_result_score == 0.0),
+                "score_1": sum(1 for e in evals if e.gold_result_score == 1.0),
+            },
+            "full_restore_score_distribution": {
+                "score_0": sum(1 for e in evals if e.full_restore_score == 0.0),
+                "score_1": sum(1 for e in evals if e.full_restore_score == 1.0),
             },
         }
     else:
@@ -339,12 +399,28 @@ def main() -> None:
         "Judge:           provider=%s  model=%s", judge_cfg.provider, judge_llm.model
     )
     logger.info(
-        "Workers: %d  explanation_turns: %d  fix_turns: %d",
-        args.workers, args.max_explanation_turns, args.max_fix_turns,
+        "Workers: %d  explanation_turns: %d  fix_turns: %d  max_fix_retries: %d",
+        args.workers, args.max_explanation_turns, args.max_fix_turns, args.max_fix_retries,
+    )
+    logger.info(
+        "Penalties: expl_query=%.3f  fix_query=%.3f  ask_question=%.3f",
+        args.explanation_query_penalty, args.fix_query_penalty, args.ask_question_penalty,
     )
     logger.info("-" * 60)
 
-    db_base_dir = Path(args.db_dir)
+    # Apply dataset preset if --db-dir was not explicitly overridden
+    _DATASET_DB_DIRS = {
+        "bird_train":   str(config.BIRD_TRAIN_DB_DIR),
+        "bird_dev":     str(config.BIRD_DEV_DB_DIR),
+        "spider_train": str(config.SPIDER_TRAIN_DB_DIR),
+        "spider_dev":   str(config.SPIDER_DEV_DB_DIR),
+        "spider_test":  str(config.SPIDER_TEST_DB_DIR),
+    }
+    if args.dataset_preset and args.db_dir == str(config.DB_BASE_DIR):
+        db_base_dir = Path(_DATASET_DB_DIRS[args.dataset_preset])
+        logger.info("Dataset preset '%s' → db_dir=%s", args.dataset_preset, db_base_dir)
+    else:
+        db_base_dir = Path(args.db_dir)
     sandbox_dir = Path(args.output_dir) / "sandbox"
     output_dir = Path(args.output_dir)
 
@@ -367,6 +443,10 @@ def main() -> None:
                 max_explanation_turns=args.max_explanation_turns,
                 max_fix_turns=args.max_fix_turns,
                 question_penalty=args.question_penalty,
+                max_fix_retries=args.max_fix_retries,
+                explanation_query_penalty=args.explanation_query_penalty,
+                fix_query_penalty=args.fix_query_penalty,
+                ask_question_penalty=args.ask_question_penalty,
             )
         except Exception as exc:
             # Errors before runner creates its SampleLog (e.g., DB not found)
@@ -410,10 +490,16 @@ def main() -> None:
 
     logger.info("=" * 60)
     logger.info("DONE in %.1fs — %d/%d records processed", elapsed, len(results), len(records))
-    logger.info("Avg fix score:          %s", stats.get("avg_fix_score", "N/A"))
-    logger.info("Avg explanation score:  %s", stats.get("avg_explanation_score", "N/A"))
-    logger.info("Avg final score:        %s", stats.get("avg_final_score", "N/A"))
-    logger.info("Avg questions asked:    %s", stats.get("avg_questions_asked", "N/A"))
+    logger.info("Avg alteration type score: %s", stats.get("avg_alteration_type_score", "N/A"))
+    logger.info("Avg explanation score:     %s", stats.get("avg_explanation_score", "N/A"))
+    logger.info("Avg gold result score:     %s", stats.get("avg_gold_result_score", "N/A"))
+    logger.info("Avg full restore score:    %s", stats.get("avg_full_restore_score", "N/A"))
+    logger.info("Avg final score:           %s", stats.get("avg_final_score", "N/A"))
+    logger.info("Avg questions asked:       %s", stats.get("avg_questions_asked", "N/A"))
+    logger.info("Avg expl query turns:      %s", stats.get("avg_explanation_query_turns", "N/A"))
+    logger.info("Avg fix query turns:       %s", stats.get("avg_fix_query_turns", "N/A"))
+    logger.info("Avg tool penalty:          %s", stats.get("avg_tool_penalty", "N/A"))
+    logger.info("Fix retried count:         %s", stats.get("fix_retried_count", "N/A"))
     if errors:
         logger.warning("Failed records: %s", ", ".join(errors))
     logger.info("Results: %s", results_path)

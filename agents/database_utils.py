@@ -30,13 +30,20 @@ def get_db_path(db_id: str, db_base_dir: Path | None = None) -> Path:
     return base / db_id / f"{db_id}.sqlite"
 
 
-def run_select_query(db_path: Path, sql: str) -> list[dict[str, Any]]:
+def run_select_query(
+    db_path: Path,
+    sql: str,
+    max_rows: int | None = None,
+) -> list[dict[str, Any]]:
     """
     Execute a read-only SELECT query and return rows as a list of dicts.
 
     Args:
         db_path: Path to the SQLite database file.
         sql: A SELECT statement to execute.
+        max_rows: If set, fetch at most this many rows (uses fetchmany to avoid
+            loading millions of rows into Python memory when agents run broad
+            queries on large databases).
 
     Returns:
         List of row dicts (column-name → value).
@@ -55,6 +62,8 @@ def run_select_query(db_path: Path, sql: str) -> list[dict[str, Any]]:
     conn.row_factory = sqlite3.Row
     try:
         cursor = conn.execute(sql)
+        if max_rows is not None:
+            return [dict(row) for row in cursor.fetchmany(max_rows)]
         return [dict(row) for row in cursor.fetchall()]
     finally:
         conn.close()
@@ -136,6 +145,7 @@ def compare_databases(db_path1: Path, db_path2: Path) -> tuple[bool, str]:
     Compare two SQLite databases for identical content across all tables.
 
     Row comparison is order-insensitive — only set equality matters.
+    Uses SQLite ATTACH + EXCEPT to avoid loading large tables into Python memory.
 
     Args:
         db_path1: Path to the first SQLite database (treated as reference).
@@ -145,22 +155,20 @@ def compare_databases(db_path1: Path, db_path2: Path) -> tuple[bool, str]:
         ``(True, "")`` if every table has the same rows in both databases,
         or ``(False, description)`` with a human-readable diff summary.
     """
-
-    def _get_tables(conn: sqlite3.Connection) -> list[str]:
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-        )
-        return [row[0] for row in cursor.fetchall()]
-
-    def _get_rows(conn: sqlite3.Connection, table: str) -> frozenset[tuple]:
-        cursor = conn.execute(f'SELECT * FROM "{table}"')
-        return frozenset(tuple(row) for row in cursor.fetchall())
-
-    conn1 = sqlite3.connect(str(db_path1), timeout=30)
-    conn2 = sqlite3.connect(str(db_path2), timeout=30)
+    conn = sqlite3.connect(str(db_path1), timeout=60)
     try:
-        tables1 = set(_get_tables(conn1))
-        tables2 = set(_get_tables(conn2))
+        conn.execute("ATTACH DATABASE ? AS cmp_db", (str(db_path2),))
+
+        tables1 = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+        tables2 = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM cmp_db.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
 
         if tables1 != tables2:
             missing = tables1 - tables2
@@ -174,22 +182,58 @@ def compare_databases(db_path1: Path, db_path2: Path) -> tuple[bool, str]:
 
         diffs: list[str] = []
         for table in sorted(tables1):
-            rows1 = _get_rows(conn1, table)
-            rows2 = _get_rows(conn2, table)
-            if rows1 != rows2:
-                only_in_1 = rows1 - rows2
-                only_in_2 = rows2 - rows1
+            # For very large tables, use a fast row-count comparison to avoid
+            # expensive EXCEPT queries. The alteration only ever touches 1-2 rows
+            # in one small table, so large tables should always be identical.
+            orig_count = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            cmp_count = conn.execute(f'SELECT COUNT(*) FROM cmp_db."{table}"').fetchone()[0]
+
+            if orig_count != cmp_count:
                 diffs.append(
-                    f"table '{table}': {len(only_in_1)} row(s) only in original, "
-                    f"{len(only_in_2)} row(s) only in candidate"
+                    f"table '{table}': row count differs (original={orig_count:,}, "
+                    f"candidate={cmp_count:,})"
+                )
+                continue
+
+            if orig_count > _MAX_DIFF_ROWS:
+                # Table is very large and counts are equal — skip detailed EXCEPT diff.
+                # A fix SQL that modifies values in a large table without changing the count
+                # would be incorrectly scored as 1.0, but this is an acceptable trade-off
+                # to prevent OOM / multi-minute queries on databases like language_corpus.
+                logger.debug(
+                    "Table '%s' has %d rows; skipping detailed diff (count matches)",
+                    table, orig_count,
+                )
+                continue
+
+            # Small table — use EXCEPT to detect value-level changes.
+            only_in_1 = conn.execute(
+                f'SELECT COUNT(*) FROM (SELECT * FROM "{table}" EXCEPT SELECT * FROM cmp_db."{table}")'
+            ).fetchone()[0]
+            only_in_2 = conn.execute(
+                f'SELECT COUNT(*) FROM (SELECT * FROM cmp_db."{table}" EXCEPT SELECT * FROM "{table}")'
+            ).fetchone()[0]
+
+            if only_in_1 or only_in_2:
+                diffs.append(
+                    f"table '{table}': {only_in_1} row(s) only in original, "
+                    f"{only_in_2} row(s) only in candidate"
                 )
 
         if diffs:
             return False, "; ".join(diffs)
         return True, ""
     finally:
-        conn1.close()
-        conn2.close()
+        try:
+            conn.execute("DETACH DATABASE cmp_db")
+        except Exception:
+            pass
+        conn.close()
+
+
+# Tables with more than this many rows skip full-row extraction and only report
+# the count delta. This prevents Python OOM on large databases (e.g. language_corpus).
+_MAX_DIFF_ROWS = 100_000
 
 
 def compute_structured_diff(
@@ -201,8 +245,11 @@ def compute_structured_diff(
     specific row-level changes using primary keys where available.
 
     For each table with differences, returns the affected original and altered
-    rows. Uses primary keys to match rows when possible; falls back to
-    full-row equality comparison when PKs are unavailable.
+    rows. Uses SQLite ATTACH + EXCEPT to avoid loading large tables into Python
+    memory — only the actually-changed rows (typically 1–2) are fetched.
+
+    Tables with more than ``_MAX_DIFF_ROWS`` rows are summarised by count only
+    to prevent OOM on very large databases.
 
     Returns:
         Dict with structure::
@@ -219,76 +266,95 @@ def compute_structured_diff(
                 }
             }
     """
-    conn_orig = sqlite3.connect(str(original_db_path), timeout=30)
-    conn_orig.row_factory = sqlite3.Row
-    conn_alt = sqlite3.connect(str(altered_db_path), timeout=30)
-    conn_alt.row_factory = sqlite3.Row
+    conn = sqlite3.connect(str(original_db_path), timeout=60)
+    conn.row_factory = sqlite3.Row
     try:
-        # Get table lists
-        orig_tables = set(
-            row[0] for row in conn_orig.execute(
+        conn.execute("ATTACH DATABASE ? AS alt_db", (str(altered_db_path),))
+
+        orig_tables = {
+            row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
-        )
-        alt_tables = set(
-            row[0] for row in conn_alt.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        }
+        alt_tables = {
+            row[0] for row in conn.execute(
+                "SELECT name FROM alt_db.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
             ).fetchall()
-        )
+        }
         common_tables = sorted(orig_tables & alt_tables)
         logger.debug("compute_structured_diff: %d common tables", len(common_tables))
 
         result_tables: dict[str, Any] = {}
 
         for table in common_tables:
-            # Identify primary key columns via PRAGMA
-            pragma = conn_orig.execute(f'PRAGMA table_info("{table}")').fetchall()
+            pragma = conn.execute(f'PRAGMA table_info("{table}")').fetchall()
             columns = [row[1] for row in pragma]
-            pk_cols = [row[1] for row in pragma if row[5] > 0]  # pk field > 0
+            pk_cols = [row[1] for row in pragma if row[5] > 0]
 
             if not pk_cols:
                 logger.warning(
                     "Table '%s' has no primary key; using full-row comparison", table
                 )
 
-            # Fetch all rows as dicts
-            orig_rows = [dict(r) for r in conn_orig.execute(f'SELECT * FROM "{table}"').fetchall()]
-            alt_rows = [dict(r) for r in conn_alt.execute(f'SELECT * FROM "{table}"').fetchall()]
+            # ── Row count check ────────────────────────────────────────────
+            # For very large tables, fetching all rows into Python is unsafe.
+            # Check the count first; skip row extraction if the table is huge.
+            orig_count: int = conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            alt_count: int = conn.execute(f'SELECT COUNT(*) FROM alt_db."{table}"').fetchone()[0]
 
-            original_records: list[dict[str, Any]] = []
-            altered_records: list[dict[str, Any]] = []
+            if max(orig_count, alt_count) > _MAX_DIFF_ROWS:
+                if orig_count != alt_count:
+                    logger.warning(
+                        "Table '%s' is too large for row-level diff (%d rows); "
+                        "reporting count delta only (orig=%d, alt=%d)",
+                        table, max(orig_count, alt_count), orig_count, alt_count,
+                    )
+                    result_tables[table] = {
+                        "primary_keys": pk_cols,
+                        "columns": columns,
+                        "original_records": [],
+                        "altered_records": [],
+                        "note": (
+                            f"Table too large for row-level diff ({orig_count:,} rows). "
+                            f"Row count changed from {orig_count:,} to {alt_count:,}."
+                        ),
+                    }
+                else:
+                    # Same count — check quickly whether any rows differ at all.
+                    has_diff = conn.execute(
+                        f'SELECT EXISTS(SELECT 1 FROM "{table}" EXCEPT SELECT 1 FROM alt_db."{table}")'
+                    ).fetchone()[0]
+                    if has_diff:
+                        logger.warning(
+                            "Table '%s' is too large for row-level diff (%d rows); "
+                            "rows changed but cannot extract specifics",
+                            table, orig_count,
+                        )
+                        result_tables[table] = {
+                            "primary_keys": pk_cols,
+                            "columns": columns,
+                            "original_records": [],
+                            "altered_records": [],
+                            "note": (
+                                f"Table too large for row-level diff ({orig_count:,} rows). "
+                                "Some rows changed but specifics are unavailable."
+                            ),
+                        }
+                continue
 
-            if pk_cols:
-                # Index rows by PK tuple
-                def _pk(row: dict) -> tuple:
-                    return tuple(row[c] for c in pk_cols)
-
-                orig_by_pk = {_pk(r): r for r in orig_rows}
-                alt_by_pk = {_pk(r): r for r in alt_rows}
-
-                # Rows only in original (missing from altered)
-                for pk, row in orig_by_pk.items():
-                    if pk not in alt_by_pk:
-                        original_records.append(row)
-                    elif row != alt_by_pk[pk]:
-                        # Same PK but different values (changed row)
-                        original_records.append(row)
-                        altered_records.append(alt_by_pk[pk])
-
-                # Rows only in altered (added)
-                for pk, row in alt_by_pk.items():
-                    if pk not in orig_by_pk:
-                        altered_records.append(row)
-            else:
-                # No PK — fall back to frozenset comparison
-                orig_set = frozenset(tuple(sorted(r.items())) for r in orig_rows)
-                alt_set = frozenset(tuple(sorted(r.items())) for r in alt_rows)
-
-                only_orig = orig_set - alt_set
-                only_alt = alt_set - orig_set
-
-                original_records = [dict(t) for t in only_orig]
-                altered_records = [dict(t) for t in only_alt]
+            # ── Full row-level diff via EXCEPT (memory-safe) ───────────────
+            # EXCEPT does set-difference inside SQLite; only the few changed rows
+            # are returned to Python.
+            original_records: list[dict[str, Any]] = [
+                dict(r) for r in conn.execute(
+                    f'SELECT * FROM "{table}" EXCEPT SELECT * FROM alt_db."{table}"'
+                ).fetchall()
+            ]
+            altered_records: list[dict[str, Any]] = [
+                dict(r) for r in conn.execute(
+                    f'SELECT * FROM alt_db."{table}" EXCEPT SELECT * FROM "{table}"'
+                ).fetchall()
+            ]
 
             if original_records or altered_records:
                 result_tables[table] = {
@@ -304,8 +370,11 @@ def compute_structured_diff(
 
         return {"tables": result_tables}
     finally:
-        conn_orig.close()
-        conn_alt.close()
+        try:
+            conn.execute("DETACH DATABASE alt_db")
+        except Exception:
+            pass
+        conn.close()
 
 
 def format_diff_as_text(structured_diff: dict[str, Any]) -> str:

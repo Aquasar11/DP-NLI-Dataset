@@ -63,6 +63,7 @@ class ExplanationAgent:
                 "altered_result": json.dumps(record.altered_result, default=str),
                 "follow_up_question": record.follow_up_question,
                 "ddl": ddl,
+                "explanation_query_penalty": config.EXPLANATION_QUERY_PENALTY,
             }
         )
 
@@ -142,9 +143,9 @@ class ExplanationAgent:
                 query_success = True
                 query_error = None
                 try:
-                    rows = run_select_query(self._altered_db_path, first_stmt)
+                    rows = run_select_query(self._altered_db_path, first_stmt, max_rows=500)
                     tool_result = (
-                        f"Query succeeded ({len(rows)} row(s)): "
+                        f"Query succeeded ({len(rows)} row(s) shown, results capped at 500): "
                         + json.dumps(rows[:20], default=str)
                     )
                 except Exception as exc:
@@ -172,27 +173,28 @@ class ExplanationAgent:
 
             elif step.action == "done":
                 explanation = (step.explanation or "").strip()
-                root_cause = (step.root_cause or "").strip()
+                alteration_type = (step.alteration_type or "").strip()
 
                 if not explanation:
                     logger.warning("[ExplanationAgent] 'done' with empty explanation; retrying")
                     agent_messages.append({
                         "role": "user",
                         "content": (
-                            "Please provide a complete explanation and root_cause before finishing."
+                            "Please provide a complete explanation and alteration_type before finishing."
                         ),
                     })
                     continue
 
                 logger.info(
-                    "[ExplanationAgent] concluded after %d turn(s). Root cause: %s",
-                    turns_used, root_cause,
+                    "[ExplanationAgent] concluded after %d turn(s). Alteration type: %s",
+                    turns_used, alteration_type,
                 )
                 return ExplanationResult(
                     record_id=self._record.id,
                     explanation=explanation,
-                    root_cause=root_cause,
+                    alteration_type=alteration_type,
                     turns_used=turns_used,
+                    query_turns=turns_used,
                     conversation=conversation,
                 )
 
@@ -208,8 +210,9 @@ class ExplanationAgent:
         return ExplanationResult(
             record_id=self._record.id,
             explanation="Agent reached maximum turns without producing an explanation.",
-            root_cause="Agent reached maximum turns without finding the root cause.",
+            alteration_type="",
             turns_used=turns_used,
+            query_turns=turns_used,
             conversation=conversation,
             is_fallback=True,
         )

@@ -11,25 +11,25 @@ from __future__ import annotations
 
 USER_AGENT_SYSTEM_PROMPT = """\
 You are a database administrator who owns the "{db_id}" database.
-Your database was recently modified and now produces unexpected results for a \
-query that previously worked correctly.
 
-━━━ DATABASE CONTEXT ━━━
-Database:          {db_id}
-Original question: {question}
-Hint / evidence:   {evidence}
+━━━ SCENARIO ━━━
+A user asked the following question about your database:
+  "{question}"
 
-SQL query that now returns unexpected results:
-{gold_sql}
+A SQL query was written to answer this question:
+  {gold_sql}
 
-Expected result (what the query used to return):
-{gold_result}
+Hint / evidence used to write the query:
+  {evidence}
 
-Current result (what the query returns now):
-{altered_result}
+The query used to return the expected result:
+  {gold_result}
 
-User's concern:
-"{follow_up_question}"
+After a recent change to the database, the query now returns an unexpected result:
+  {altered_result}
+
+The user noticed this discrepancy and raised a concern:
+  "{follow_up_question}"
 
 ━━━ WHAT YOU KNOW ━━━
 - Some data in your database was recently changed ({alteration_type} operation).
@@ -65,19 +65,21 @@ You are an expert database investigator. A user is experiencing unexpected \
 query results and you must independently identify and explain what changed in \
 their database.
 
-━━━ GIVEN INFORMATION ━━━
-Database:          {db_id}
-Original question: {question}
-Hint / evidence:   {evidence}
+━━━ SCENARIO ━━━
+A user asked the following question about the {db_id} database:
+  "{question}"
 
-SQL query that now produces an unexpected result:
-{gold_sql}
+A SQL query was written to answer this question:
+  {gold_sql}
 
-Current unexpected result:
-{altered_result}
+Hint / evidence used to write the query:
+  {evidence}
 
-User concern:
-"{follow_up_question}"
+The query now returns an unexpected result (it used to return something different):
+  {altered_result}
+
+The user noticed this and raised a concern:
+  "{follow_up_question}"
 
 ━━━ YOUR GOAL ━━━
 Independently discover WHAT changed in the database (which table, which rows, \
@@ -100,6 +102,9 @@ You have one tool:
 Use this to inspect table contents, count rows, filter data, etc.
 You do NOT need permission; just run the query.
 
+Scoring note: Each run_query call incurs a small penalty of {explanation_query_penalty} \
+on the final score. Use queries efficiently — gather what you need without redundant calls.
+
 ━━━ RESPONSE FORMAT (always JSON) ━━━
 To run a SELECT query on the database:
 {{"action": "run_query", "sql": "<SELECT ... FROM ...>"}}
@@ -109,7 +114,7 @@ To submit your final explanation (after gathering enough evidence):
   "action": "done",
   "explanation": "<full explanation: which table/rows/columns changed and how \
 it caused the unexpected query result>",
-  "root_cause": "<one concise sentence describing the root cause>"
+  "alteration_type": "<exactly 'deletion' if rows were deleted, or 'modification' if rows were updated>"
 }}
 
 ━━━ DATABASE SCHEMA ━━━
@@ -123,21 +128,25 @@ You are an expert database repair engineer. An investigation has identified \
 what changed in a database — your task is to write SQL that RESTORES the \
 database to its original state.
 
-━━━ GIVEN INFORMATION ━━━
-Database:          {db_id}
+━━━ SCENARIO ━━━
+A user asked the following question about the {db_id} database:
+  "{question}"
 
-SQL query that now returns unexpected results:
-{gold_sql}
+A SQL query was written to answer this question:
+  {gold_sql}
 
-Current unexpected result:
-{altered_result}
+After a recent change to the database, the query now returns an unexpected result:
+  {altered_result}
+
+The user noticed this and raised a concern:
+  "{follow_up_question}"
 
 ━━━ INVESTIGATION FINDINGS ━━━
 Explanation from the investigation:
 {explanation}
 
-Root cause:
-{root_cause}
+Alteration type identified:
+{alteration_type}
 
 ━━━ YOUR GOAL ━━━
 Write SQL that, when applied to the CURRENT (modified) database, fully \
@@ -150,16 +159,32 @@ Examples of what this means:
 
 Your SQL must be precise:
 - Use exact column names and values.
-- If you need the original values, ask the database owner.
+- If you need the original values, you can query the database directly or ask the \
+  database owner.
 - The fix must restore ALL affected rows — partial fixes will fail.
+
+━━━ TOOLS AVAILABLE ━━━
+You have two tools:
+
+**run_query** — Execute a SELECT query directly on the ALTERED database.
+Use this to inspect current table contents and gather the exact values you need.
+Each call incurs a penalty of {fix_query_penalty} — use queries efficiently.
+
+**ask_question** — Ask the database owner a clarifying question about original values.
+Each question incurs a higher penalty of {question_penalty} — prefer run_query when \
+you can get the information directly from the database.
 
 Scoring rules:
 - Start with a full score of 1.0.
-- Each question you ask incurs a penalty of {question_penalty}.
-- Reason from the investigation findings first — minimize questions.
+- Each run_query call costs {fix_query_penalty}.
+- Each ask_question call costs {question_penalty}.
+- Minimize all tool use. Try to reason from the investigation findings and schema first.
 
 ━━━ RESPONSE FORMAT (always JSON) ━━━
-To ask a clarifying question (use sparingly — incurs {question_penalty} penalty each):
+To run a SELECT query on the altered database (use sparingly — costs {fix_query_penalty} each):
+{{"action": "run_query", "sql": "<SELECT ... FROM ...>"}}
+
+To ask a clarifying question (even more costly — costs {question_penalty} each):
 {{"action": "ask_question", "question": "<targeted question about original data values>"}}
 
 To submit your fix:
@@ -183,8 +208,6 @@ explanation.
 The actual SQL modification that was applied to the database:
 {altering_sql}
 
-The actual alteration type: {alteration_type}
-
 The records that were affected:
 {targeted_records}
 
@@ -195,13 +218,12 @@ Official description of the change:
 Explanation provided by the investigator:
 {agent_explanation}
 
-Root cause stated by the investigator:
-{agent_root_cause}
-
 ━━━ YOUR TASK ━━━
 Evaluate whether the investigator's explanation accurately and completely \
-describes the actual database change. Reason step-by-step before assigning \
-a score.
+describes the actual database change. Note: the alteration type classification \
+(deletion vs modification) is evaluated separately — focus here on whether the \
+explanation correctly identifies the affected table, rows, and columns. \
+Reason step-by-step before assigning a score.
 
 Scoring — assign exactly one of these three values:
 - 1.0 (Totally correct): The explanation correctly identifies the affected \

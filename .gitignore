@@ -11,3 +11,5 @@ CLAUDE.md
 query_debugging_scenario/src/llms/gcp_credentials/credential.json
 .env
 .env.local
+data/
+*.zip

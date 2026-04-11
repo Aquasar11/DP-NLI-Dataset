@@ -83,13 +83,16 @@ All agents communicate via structured JSON responses.
 {"action": "done", "explanation": "...", "root_cause": "..."}
 ```
 
-**FixAgent** (repair loop):
+**FixAgent** (repair loop — three actions):
 ```json
-// Ask a clarifying question (incurs penalty):
+// Query the altered database directly (same tool as ExplanationAgent):
+{"action": "run_query", "sql": "SELECT ..."}
+
+// Ask the UserAgent a clarifying question (incurs penalty):
 {"action": "ask_question", "question": "..."}
 
 // Submit the fix:
-{"action": "done", "fix_sql": "INSERT INTO ...", "confidence": 0.9, "reasoning": "..."}
+{"action": "done", "fix_sql": "INSERT INTO ...", "reasoning": "..."}
 ```
 
 ---
@@ -149,17 +152,40 @@ The framework consumes `dataset.json` produced by the `data_debugging_scenario` 
 
 The fix evaluation uses a **relaxed** approach — the goal is to restore the expected query result without corrupting other records, not necessarily to achieve an exact full-database match.
 
-| `fix_score` | Meaning |
-|---|---|
-| **0.0** | `gold_sql` does not return `gold_result` after fix, OR previously-good records were corrupted |
-| **1.0** | `gold_sql` returns `gold_result` AND no previously-good records were corrupted |
-| **1.5** | Additionally, all corrupted rows are fully restored to their original values (exact DB match) |
+| `gold_result_score` | `full_restore_score` | Meaning |
+|---|---|---|
+| **0.0** | 0.0 | `gold_sql` does not return `gold_result` after fix |
+| **1.0** | 0.0 | `gold_sql` returns `gold_result` but DB not fully restored |
+| **1.0** | 1.0 | `gold_sql` returns `gold_result` AND DB is byte-identical to original |
+
+### Per-Tool Penalty System
+
+Every tool call incurs a configurable score deduction. All three tool types are penalized:
+
+| Tool | Default penalty | CLI flag |
+|---|---|---|
+| `ExplanationAgent.run_query` | `0.01` per call | `--explanation-query-penalty` |
+| `FixAgent.run_query` | `0.02` per call | `--fix-query-penalty` |
+| `FixAgent.ask_question` | `0.05` per call | `--ask-question-penalty` |
 
 ```
-final_score = max(0.0, fix_score - question_penalty * questions_asked)
+tool_penalty = EXPLANATION_QUERY_PENALTY × explanation_query_turns
+             + FIX_QUERY_PENALTY         × fix_query_turns
+             + ASK_QUESTION_PENALTY      × questions_asked
+
+final_score  = max(0.0, gold_result_score − tool_penalty)
 ```
 
-**Question penalty** — every question the `FixAgent` asks costs `question_penalty` (default `0.05`) from the final score. The agent is incentivized to reason from the `ExplanationAgent`'s output before asking questions.
+The penalty breakdown is recorded in `EvaluationResult.tool_penalty_breakdown`.
+
+### Fix Agent Retry
+
+If the `FixAgent`'s first attempt scores 0 on the gold result check, it automatically gets one retry. The retry receives a feedback message containing:
+- The previous (failed) fix SQL
+- What `gold_sql` actually returned after applying it
+- What the expected `gold_result` is
+
+The retry uses the same `max_fix_turns` budget as the first attempt. The number of retries used is recorded in `FixResult.retry_count`. Configure with `--max-fix-retries` (default: `1`; set to `0` to disable).
 
 ### Explanation Score (LLM-as-Judge)
 
@@ -282,9 +308,14 @@ The `judge` defaults to the same settings as `user-agent` if not explicitly conf
 | `--workers` | `1` | Parallel workers (ThreadPoolExecutor) |
 | `--max-explanation-turns` | `6` | Max turns for the `ExplanationAgent` |
 | `--max-fix-turns` | `4` | Max turns for the `FixAgent` |
-| `--question-penalty` | `0.05` | Score penalty per `FixAgent` question |
+| `--max-fix-retries` | `1` | Retry attempts for FixAgent after a failed fix (0 = disable) |
+| `--explanation-query-penalty` | `0.01` | Score penalty per `ExplanationAgent` query |
+| `--fix-query-penalty` | `0.02` | Score penalty per `FixAgent` query |
+| `--ask-question-penalty` | `0.05` | Score penalty per `FixAgent` question to UserAgent |
+| `--question-penalty` | `0.05` | Deprecated alias for `--ask-question-penalty` |
 | `--dataset` | *(from config)* | Path to `dataset.json` |
 | `--db-dir` | *(from config)* | Root directory of SQLite database folders |
+| `--dataset-preset` | *(none)* | Auto-set `--db-dir` from a known dataset: `bird_train`, `bird_dev`, `spider_train`, `spider_test` |
 | `--output-dir` | `./output` | Directory for results and stats |
 | `--log-level` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 
@@ -345,7 +376,8 @@ A JSON array of `RunResult` objects, one per processed record:
     "explanation": {
       "record_id": 1,
       "explanation": "The part 'pink powder drab lawn cyan' was deleted from the 'part' table.",
-      "root_cause": "A row was deleted from the 'part' table.",
+      "alteration_type": "deletion",
+      "query_turns": 3,
       "turns_used": 3,
       "conversation": [],
       "is_fallback": false
@@ -353,9 +385,10 @@ A JSON array of `RunResult` objects, one per processed record:
     "fix": {
       "record_id": 1,
       "fix_sql": "INSERT INTO part (p_partkey, p_name, ...) VALUES (42, 'pink powder drab lawn cyan', ...);",
-      "confidence": 0.92,
       "reasoning": "The explanation confirms the row was deleted. I asked for the original values.",
       "questions_asked": 1,
+      "query_turns": 2,
+      "retry_count": 0,
       "conversation": [
         {"role": "FixAgent", "content": "What were the original column values for that part?"},
         {"role": "UserAgent", "content": "The row had p_partkey=42, p_name='pink powder drab lawn cyan', ..."}
@@ -365,14 +398,23 @@ A JSON array of `RunResult` objects, one per processed record:
     "evaluation": {
       "record_id": 1,
       "db_id": "retails",
+      "alteration_type_score": 1.0,
       "explanation_score": 1.0,
       "explanation_reasoning": "Correctly identified the deleted table and row.",
-      "fix_score": 1.5,
-      "fix_description": "gold_result matches, no corruption, and all rows fully restored",
+      "gold_result_score": 1.0,
+      "full_restore_score": 1.0,
+      "fix_description": "gold_result matches and DB fully restored to original",
       "questions_asked": 1,
-      "question_penalty": 0.05,
-      "base_score": 1.5,
-      "final_score": 1.45,
+      "explanation_query_turns": 3,
+      "fix_query_turns": 2,
+      "tool_penalty_breakdown": {
+        "explanation_query_penalty": 0.03,
+        "fix_query_penalty": 0.04,
+        "ask_question_penalty": 0.05
+      },
+      "tool_penalty": 0.12,
+      "base_score": 1.0,
+      "final_score": 0.88,
       "error": null
     }
   }
@@ -419,16 +461,18 @@ Aggregate metrics across all processed records:
 
 - **Fully autonomous**: Does NOT interact with the UserAgent or any human. Uses only `run_query` tool calls to inspect the altered database directly.
 - **Goal**: Independently discover what changed in the database — no ground-truth information is provided.
-- **Turn limit**: Configurable via `--max-explanation-turns` (default: 6). Counts `run_query` actions.
-- **Output**: `ExplanationResult` with `explanation`, `root_cause`, `turns_used`, and `is_fallback`.
+- **Turn limit**: Configurable via `--max-explanation-turns` (default: 6). Each `run_query` action consumes one turn and incurs an `explanation_query_penalty` deduction.
+- **Output**: `ExplanationResult` with `explanation`, `alteration_type`, `query_turns`, `turns_used`, and `is_fallback`.
 
 ### FixAgent
 
 - **Goal**: Produce SQL that, when applied to the altered database, restores the expected query results without corrupting other records.
 - **Inputs**: `ExplanationResult` (explanation + root_cause), database schema (DDL), and query context.
-- **Oracle access**: Can ask the UserAgent clarifying questions (e.g. original column values). Each question incurs a `question_penalty` deduction.
-- **Turn limit**: Configurable via `--max-fix-turns` (default: 4).
-- **Output**: `FixResult` with `fix_sql`, `confidence`, `reasoning`, `questions_asked`, and `is_fallback`.
+- **Direct DB access**: Can run SELECT queries against the altered sandbox, just like the `ExplanationAgent`. Each query incurs a small `fix_query_penalty` deduction.
+- **Oracle access**: Can ask the UserAgent clarifying questions (e.g. original column values). Each question incurs an `ask_question_penalty` deduction (larger than query penalty to discourage lazy questioning).
+- **Retry**: If the first fix scores 0, the agent is automatically retried once with a feedback message describing what went wrong. Configurable via `--max-fix-retries`.
+- **Turn limit**: Configurable via `--max-fix-turns` (default: 4). Shared across the initial attempt and each retry.
+- **Output**: `FixResult` with `fix_sql`, `reasoning`, `questions_asked`, `query_turns`, `retry_count`, and `is_fallback`.
 
 ### Evaluator
 
@@ -439,13 +483,17 @@ Aggregate metrics across all processed records:
 - Judge LLM is independently configurable and defaults to the UserAgent's LLM settings.
 
 **Fix evaluation (relaxed — gold_result match + no corruption)**:
-- A fresh sandbox is created: original DB -> apply `altering_sql` -> apply `fix_sql`.
-- **Primary check**: Run `gold_sql` on the fixed DB. Does it return `gold_result`? Are previously-good records still intact?
-- **Bonus check**: If additionally all corrupted rows are fully restored to their original values, score is 1.5 instead of 1.0.
+- A fresh sandbox is created: original DB → apply `altering_sql` → apply `fix_sql`.
+- **Primary check**: Run `gold_sql` on the fixed DB. Does it return `gold_result`?
+- **Restore check**: Is the fixed DB byte-identical to the original? (`full_restore_score`)
 
 **Score formula**:
 ```
-final_score = max(0.0, fix_score - question_penalty * questions_asked)
+tool_penalty = EXPLANATION_QUERY_PENALTY × explanation_query_turns
+             + FIX_QUERY_PENALTY         × fix_query_turns
+             + ASK_QUESTION_PENALTY      × questions_asked
+
+final_score  = max(0.0, gold_result_score − tool_penalty)
 ```
 
 ---
@@ -473,14 +521,14 @@ Set log level via `--log-level DEBUG|INFO|WARNING|ERROR`.
 
 | Module | Key symbols |
 |---|---|
-| `config.py` | `AgentLLMConfig`, `USER_AGENT_CONFIG`, `EXPLANATION_AGENT_CONFIG`, `FIX_AGENT_CONFIG`, `JUDGE_CONFIG`, `MAX_EXPLANATION_TURNS`, `MAX_FIX_TURNS`, `QUESTION_PENALTY` |
+| `config.py` | `AgentLLMConfig`, `USER_AGENT_CONFIG`, `EXPLANATION_AGENT_CONFIG`, `FIX_AGENT_CONFIG`, `JUDGE_CONFIG`, `MAX_EXPLANATION_TURNS`, `MAX_FIX_TURNS`, `MAX_FIX_RETRIES`, `EXPLANATION_QUERY_PENALTY`, `FIX_QUERY_PENALTY`, `ASK_QUESTION_PENALTY` |
 | `models.py` | `DatasetRecord`, `ExplanationAgentStep`, `FixAgentStep`, `ExplanationResult`, `FixResult`, `EvaluationResult`, `RunResult`, `ConversationTurn` |
 | `llm_client.py` | `LLMClient` (OpenAI), `GeminiClient`, `ChatResult` |
 | `database_utils.py` | `get_db_path()`, `run_select_query()`, `get_ddl()`, `create_altered_sandbox()`, `destroy_sandbox()`, `compare_databases()`, `compute_structured_diff()`, `format_diff_as_text()` |
 | `prompts.py` | `USER_AGENT_SYSTEM_PROMPT`, `EXPLANATION_AGENT_SYSTEM_PROMPT`, `FIX_AGENT_SYSTEM_PROMPT`, `JUDGE_SYSTEM_PROMPT` |
 | `user_agent.py` | `UserAgent.respond()` |
 | `explanation_agent.py` | `ExplanationAgent.run()` |
-| `fix_agent.py` | `FixAgent.run(user_agent)` |
-| `evaluator.py` | `evaluate(record, fix_result, explanation_result, judge_llm, ...)` |
+| `fix_agent.py` | `FixAgent.run(user_agent, retry_context=None)` |
+| `evaluator.py` | `evaluate(...)`, `quick_fix_check(record, fix_result, ...)` |
 | `runner.py` | `run_record(record, user_llm, explanation_llm, fix_llm, judge_llm, ...)` |
 | `main.py` | CLI entry point |

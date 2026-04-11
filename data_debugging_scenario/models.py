@@ -20,11 +20,27 @@ class AlterationType(str, Enum):
 # ── Input Models (BIRD dataset) ───────────────────────────────────────────────
 
 class BirdSample(BaseModel):
-    """A single entry from the BIRD train.json."""
+    """A single entry from the BIRD train.json or dev.json."""
     db_id: str
     question: str
     evidence: str
     SQL: str
+
+
+class SpiderSample(BaseModel):
+    """A single entry from a Spider train_spider.json or test.json."""
+    db_id: str
+    question: str
+    query: str  # Spider uses 'query'; BIRD uses 'SQL'
+
+    def to_bird_sample(self) -> "BirdSample":
+        """Normalize to BirdSample for uniform pipeline processing."""
+        return BirdSample(
+            db_id=self.db_id,
+            question=self.question,
+            evidence="",   # Spider has no evidence field
+            SQL=self.query,
+        )
 
 
 class TableSchema(BaseModel):
