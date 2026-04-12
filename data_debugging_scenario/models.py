@@ -125,3 +125,4 @@ class DatasetRecord(BaseModel):
     altered_result: list[dict[str, Any]]
     alteration_explanation: str
     follow_up_question: str
+    is_aggregation: bool = False

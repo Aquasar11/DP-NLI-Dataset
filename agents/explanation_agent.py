@@ -64,6 +64,7 @@ class ExplanationAgent:
                 "follow_up_question": record.follow_up_question,
                 "ddl": ddl,
                 "explanation_query_penalty": config.EXPLANATION_QUERY_PENALTY,
+                "max_turns": self._max_turns,
             }
         )
 
@@ -104,7 +105,28 @@ class ExplanationAgent:
                 turn, self._max_turns, len(agent_messages),
             )
 
-            result, data = self._llm.chat_json(self._system_prompt, agent_messages)
+            messages_for_llm = list(agent_messages)
+            if turn == self._max_turns:
+                messages_for_llm.append({
+                    "role": "user",
+                    "content": (
+                        f"[FINAL TURN {turn}/{self._max_turns}] "
+                        "This is your last allowed turn. "
+                        "You MUST respond with action='done' right now — "
+                        "submit your explanation immediately, no more run_query calls are possible."
+                    ),
+                })
+            elif turn == self._max_turns - 1:
+                messages_for_llm.append({
+                    "role": "user",
+                    "content": (
+                        f"[Turn {turn}/{self._max_turns} — 1 turn remaining] "
+                        "You have only one more turn after this. "
+                        "Wrap up your investigation and prepare to submit 'done' next turn."
+                    ),
+                })
+
+            result, data = self._llm.chat_json(self._system_prompt, messages_for_llm)
 
             if self._pipeline_logger:
                 self._pipeline_logger.log_llm_call(

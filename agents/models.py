@@ -27,6 +27,7 @@ class DatasetRecord(BaseModel):
     altered_result: list[dict[str, Any]]
     alteration_explanation: str
     follow_up_question: str
+    is_aggregation: bool = False
 
 
 # ── Structured LLM action schemas ────────────────────────────────────────────
@@ -158,6 +159,18 @@ class RunResult(BaseModel):
 
     record_id: int
     db_id: str
+    # ── Sample snapshot (makes results.json self-contained) ──────────────
+    question: str = ""
+    evidence: str = ""
+    gold_sql: str = ""
+    gold_result: list[dict[str, Any]] = Field(default_factory=list)
+    alteration_type: str = ""
+    altering_sql: str = ""
+    altered_result: list[dict[str, Any]] = Field(default_factory=list)
+    alteration_explanation: str = ""
+    follow_up_question: str = ""
+    is_aggregation: bool = False
+    # ── Agent outputs ─────────────────────────────────────────────────────
     explanation: ExplanationResult
     fix: FixResult
     evaluation: EvaluationResult

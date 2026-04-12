@@ -111,6 +111,9 @@ You do NOT need permission; just run the query.
 Scoring note: Each run_query call incurs a small penalty of {explanation_query_penalty} \
 on the final score. Use queries efficiently — gather what you need without redundant calls.
 
+Turn budget: You have a maximum of {max_turns} turns (run_query calls). \
+Submit 'done' as soon as you have sufficient evidence — do not wait until the last turn.
+
 ━━━ RESPONSE FORMAT (always JSON) ━━━
 To run a SELECT query on the database:
 {{"action": "run_query", "sql": "<SELECT ... FROM ...>"}}
@@ -187,6 +190,9 @@ Scoring rules:
 - Each run_query call costs {fix_query_penalty}.
 - Each ask_question call costs {question_penalty}.
 - Minimize all tool use. Try to reason from the investigation findings and schema first.
+
+Turn budget: You have a maximum of {max_turns} turns total. \
+Submit 'done' as soon as you can write the fix confidently — do not wait until the last turn.
 
 ━━━ RESPONSE FORMAT (always JSON) ━━━
 To run a SELECT query on the altered database (use sparingly — costs {fix_query_penalty} each):

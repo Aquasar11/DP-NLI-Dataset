@@ -23,10 +23,12 @@ This tool constructs such a dataset by extending a seed text-to-SQL dataset (BIR
 | `gold_result` | Query result on the original (correct) database |
 | `alteration_type` | `delete` (remove entire row) or `modify` (change column values) |
 | `targeted_records` | The specific result records that were targeted for removal |
+| `target_columns` | Columns modified (`["all"]` for DELETE; specific column name(s) for MODIFY) |
 | `altering_sql` | SQL statement(s) that corrupt the database |
 | `altered_result` | Query result on the corrupted database |
 | `alteration_explanation` | Why the altering SQL causes the targeted records to disappear |
 | `follow_up_question` | A natural question a user would ask when seeing the wrong output |
+| `is_aggregation` | `true` if the gold SQL is a scalar aggregate (e.g. `COUNT(*)` without `GROUP BY`) |
 
 ## Dataset Construction Methodology
 
@@ -48,7 +50,7 @@ Each instance maintains an isolated altered database state, reconstructable via 
 ## Project Structure
 
 ```
-input_debugging_scenario/
+data_debugging_scenario/
 ├── main.py              # CLI entry point (argparse)
 ├── config.py            # All configurable parameters
 ├── models.py            # Pydantic data models
@@ -64,11 +66,11 @@ input_debugging_scenario/
 ├── .gitignore
 ├── data/
 │   └── bird/
-│       └── train/
-│           ├── train.json           # ~9,428 BIRD samples
-│           ├── train_tables.json    # Database schemas
-│           ├── train_gold.sql       # Gold SQL queries
-│           └── train_databases/     # 69 SQLite databases
+│       └── dev/
+│           ├── dev.json           # ~9,428 BIRD samples
+│           ├── dev_tables.json    # Database schemas
+│           ├── dev_gold.sql       # Gold SQL queries
+│           └── dev_databases/     # 69 SQLite databases
 │               ├── movie_platform/
 │               ├── restaurant/
 │               └── ...
@@ -85,7 +87,7 @@ input_debugging_scenario/
 
 - Python 3.11+
 - An OpenAI API key (or compatible endpoint)
-- The BIRD-Bench train dataset (already included in `data/bird/`)
+- The BIRD-Bench dev dataset (already included in `data/bird/`)
 
 ### Local Installation
 
@@ -168,7 +170,7 @@ python main.py --samples 100
 # BIRD dev (requires dev_databases.zip extracted to data/bird_dev/database/)
 python main.py --dataset bird_dev --samples 50
 
-# Spider train
+# Spider dev
 python main.py --dataset spider_train --samples 100
 
 # Spider test
@@ -205,12 +207,19 @@ The validator checks:
 
 If validation fails, the pipeline builds a retry prompt that includes the previous attempt, the validation error, and the actual vs expected result — giving the LLM specific feedback to correct its SQL.
 
+### Aggregate Query Handling
+
+Queries containing aggregate functions (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`) without a `GROUP BY` clause return a single scalar value instead of a set of rows. These **scalar aggregate** samples are detected automatically and processed with a dedicated flow:
+
+- **Alteration target**: underlying database rows that contribute to the aggregate are altered (deleted or modified) so the aggregate value changes.
+- **Validation**: checks that the aggregate result differs after the alteration, rather than checking row-level removal.
+- **Label**: the generated record has `is_aggregation: true`.
+
 ### Skipped Samples
 
 The pipeline automatically skips samples that are not suitable for data debugging:
 - **Empty results**: Queries returning 0 rows have no records to remove
 - **Query execution errors**: Invalid SQL or missing databases
-- **Scalar aggregates**: Queries like `SELECT COUNT(*) FROM ...` without `GROUP BY` return a single number — not meaningful for row-level data debugging
 
 ### Alteration Strategies
 
@@ -234,10 +243,12 @@ The pipeline automatically skips samples that are not suitable for data debuggin
     "gold_result": [{"movie_title": "Brief Encounter"}],
     "alteration_type": "delete",
     "targeted_records": [{"movie_title": "Brief Encounter"}],
+    "target_columns": ["all"],
     "altering_sql": "DELETE FROM movies WHERE movie_title = 'Brief Encounter'",
     "altered_result": [{"movie_title": "Children of Paradise"}],
     "alteration_explanation": "Deleting 'Brief Encounter' removes it from the 1945 movies, causing the next most popular movie to appear.",
     "follow_up_question": "Why does the result show 'Children of Paradise' instead of 'Brief Encounter'?",
+    "is_aggregation": false
   }
 ]
 ```
@@ -271,7 +282,7 @@ The pipeline supports four source datasets selectable via `--dataset`:
 |---|---|---|---|
 | **BIRD-Bench train** (default) | `bird_train` | `train.json` | `SQL` |
 | **BIRD-Bench dev** | `bird_dev` | `dev.json` | `SQL` |
-| **Spider train** | `spider_train` | `train_spider.json` | `query` |
+| **Spider dev** | `spider_dev` | `dev_spider.json` | `query` |
 | **Spider test** | `spider_test` | `test.json` | `query` |
 
 Spider samples are automatically normalized to the BIRD format (`query → SQL`, `evidence = ""`). All downstream pipeline logic is identical regardless of the source dataset.
@@ -313,5 +324,5 @@ Default paths are set in `config.py` relative to the project root and can be ove
 |---|---|---|---|
 | `bird_train` | `data/bird/train/train.json` | `data/bird/train/train_databases/` | `BIRD_TRAIN_DB_DIR` |
 | `bird_dev` | `data/bird_dev/dev.json` | `data/bird_dev/database/` | `BIRD_DEV_DB_DIR` |
-| `spider_train` | `data/spider_data/train_spider.json` | `data/spider_data/database/` | `SPIDER_TRAIN_DB_DIR` |
+| `spider_dev` | `data/spider_data/dev_spider.json` | `data/spider_data/database/` | `SPIDER_DEV_DB_DIR` |
 | `spider_test` | `data/spider_data/test.json` | `data/spider_data/test_database/` | `SPIDER_TEST_DB_DIR` |

@@ -759,6 +759,7 @@ class Pipeline:
             altered_result=final_altered_result,
             alteration_explanation=final_alteration_result.explanation,
             follow_up_question=followup_response.follow_up_question,
+            is_aggregation=is_aggregate,
         )
 
         base["record_id"] = record_id

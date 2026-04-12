@@ -80,7 +80,12 @@ All agents communicate via structured JSON responses.
 {"action": "run_query", "sql": "SELECT ..."}
 
 // Conclude with an explanation:
-{"action": "done", "explanation": "...", "root_cause": "..."}
+{
+  "action": "done",
+  "explanation": "...",
+  "sql_impact": "...",
+  "alteration_type": "deletion | modification"
+}
 ```
 
 **FixAgent** (repair loop — three actions):
@@ -140,6 +145,7 @@ The framework consumes `dataset.json` produced by the `data_debugging_scenario` 
 | `altered_result` | `list[dict]` | Query result after the alteration |
 | `alteration_explanation` | `str` | Natural language explanation of the change |
 | `follow_up_question` | `str` | User's confused follow-up question |
+| `is_aggregation` | `bool` | `true` if the gold SQL is a scalar aggregate query |
 
 > **Default dataset path**: `../data_debugging_scenario/output/dataset.json`
 > **Default database path**: `../data_debugging_scenario/data/train/train_databases/`
@@ -169,11 +175,13 @@ Every tool call incurs a configurable score deduction. All three tool types are 
 | `FixAgent.ask_question` | `0.05` per call | `--ask-question-penalty` |
 
 ```
-tool_penalty = EXPLANATION_QUERY_PENALTY × explanation_query_turns
-             + FIX_QUERY_PENALTY         × fix_query_turns
-             + ASK_QUESTION_PENALTY      × questions_asked
+tool_penalty    = EXPLANATION_QUERY_PENALTY × explanation_query_turns
+                + FIX_QUERY_PENALTY         × fix_query_turns
+                + ASK_QUESTION_PENALTY      × questions_asked
 
-final_score  = max(0.0, gold_result_score − tool_penalty)
+retry_multiplier = 0.5 if fix used a retry attempt, else 1.0
+
+final_score     = max(0.0, gold_result_score − tool_penalty) × retry_multiplier
 ```
 
 The penalty breakdown is recorded in `EvaluationResult.tool_penalty_breakdown`.
@@ -373,9 +381,20 @@ A JSON array of `RunResult` objects, one per processed record:
   {
     "record_id": 1,
     "db_id": "retails",
+    "question": "How many parts are stored in the warehouse?",
+    "evidence": "",
+    "gold_sql": "SELECT COUNT(*) FROM part",
+    "gold_result": [{"COUNT(*)": 200}],
+    "alteration_type": "delete",
+    "altering_sql": "DELETE FROM part WHERE p_partkey = 42",
+    "altered_result": [{"COUNT(*)": 199}],
+    "alteration_explanation": "Deleting part 42 reduces the count from 200 to 199.",
+    "follow_up_question": "Why does the count show 199 instead of 200?",
+    "is_aggregation": true,
     "explanation": {
       "record_id": 1,
-      "explanation": "The part 'pink powder drab lawn cyan' was deleted from the 'part' table.",
+      "explanation": "The part with p_partkey=42 was deleted from the 'part' table.",
+      "sql_impact": "The DELETE reduces the row count, so COUNT(*) returns 199 instead of 200.",
       "alteration_type": "deletion",
       "query_turns": 3,
       "turns_used": 3,
@@ -462,7 +481,8 @@ Aggregate metrics across all processed records:
 - **Fully autonomous**: Does NOT interact with the UserAgent or any human. Uses only `run_query` tool calls to inspect the altered database directly.
 - **Goal**: Independently discover what changed in the database — no ground-truth information is provided.
 - **Turn limit**: Configurable via `--max-explanation-turns` (default: 6). Each `run_query` action consumes one turn and incurs an `explanation_query_penalty` deduction.
-- **Output**: `ExplanationResult` with `explanation`, `alteration_type`, `query_turns`, `turns_used`, and `is_fallback`.
+- **Turn awareness**: The agent's system prompt states the total turn budget. On the penultimate turn it receives a reminder to prepare for `done`; on the final turn it receives a hard warning that no further tool calls are allowed and it must submit `done` immediately.
+- **Output**: `ExplanationResult` with `explanation`, `sql_impact`, `alteration_type`, `query_turns`, `turns_used`, and `is_fallback`.
 
 ### FixAgent
 
@@ -472,6 +492,7 @@ Aggregate metrics across all processed records:
 - **Oracle access**: Can ask the UserAgent clarifying questions (e.g. original column values). Each question incurs an `ask_question_penalty` deduction (larger than query penalty to discourage lazy questioning).
 - **Retry**: If the first fix scores 0, the agent is automatically retried once with a feedback message describing what went wrong. Configurable via `--max-fix-retries`.
 - **Turn limit**: Configurable via `--max-fix-turns` (default: 4). Shared across the initial attempt and each retry.
+- **Turn awareness**: The system prompt states the total turn budget. On the penultimate turn the agent is reminded to prepare its `done` response; on the final turn it receives a hard warning requiring immediate `done` submission.
 - **Output**: `FixResult` with `fix_sql`, `reasoning`, `questions_asked`, `query_turns`, `retry_count`, and `is_fallback`.
 
 ### Evaluator
