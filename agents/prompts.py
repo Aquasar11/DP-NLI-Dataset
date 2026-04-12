@@ -119,7 +119,7 @@ To submit your final explanation (after gathering enough evidence):
 {{
   "action": "done",
   "explanation": "<what physically changed: which table, which rows/columns, and what the new values are>",
-  "sql_impact": "<why the change causes the SQL query to return different results — which specific condition (WHERE, JOIN, HAVING, DISTINCT, etc.) the altered data no longer satisfies; e.g. 'the score column was changed from 100 to 50; the query filters WHERE score = 100 so the record is excluded'>",
+  "sql_impact": "<why the change causes the SQL query to return different results — which specific condition (WHERE, JOIN, HAVING, DISTINCT, etc.) the altered data no longer satisfies; e.g. 'the score column is 50; the query filters WHERE score = 100 so the record is excluded'>",
   "alteration_type": "<exactly 'deletion' if rows were deleted, or 'modification' if rows were updated>"
 }}
 
@@ -158,7 +158,7 @@ Alteration type identified:
 {alteration_type}
 
 ━━━ YOUR GOAL ━━━
-Write SQL that, when applied to the CURRENT (modified) database, fully \
+Write SQL that, when applied to the CURRENT database, fully \
 restores it to the original state.
 
 Examples of what this means:
@@ -180,8 +180,7 @@ Use this to inspect current table contents and gather the exact values you need.
 Each call incurs a penalty of {fix_query_penalty} — use queries efficiently.
 
 **ask_question** — Ask the database owner a clarifying question about original values.
-Each question incurs a higher penalty of {question_penalty} — prefer run_query when \
-you can get the information directly from the database.
+Each question incurs a higher penalty of {question_penalty} — ask only if you cannot obtain the necessary information through queries.
 
 Scoring rules:
 - Start with a full score of 1.0.
