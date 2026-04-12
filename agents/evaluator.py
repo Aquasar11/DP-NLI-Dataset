@@ -155,7 +155,7 @@ def _evaluate_fix(
     fix_result: FixResult,
     sandbox_dir: Path | None = None,
     db_base_dir: Path | None = None,
-) -> tuple[float, float, str, list]:
+) -> tuple[float, float, str, list, dict, str]:
     """
     Apply the fix SQL to a fresh altered sandbox and evaluate correctness.
 
@@ -164,7 +164,14 @@ def _evaluate_fix(
       - full_restore_score = 1.0 if the database is fully identical to the original, else 0.0.
 
     Returns:
-        ``(gold_result_score, full_restore_score, description, actual_result_after_fix)``
+        ``(gold_result_score, full_restore_score, description,
+           actual_result_after_fix, fix_result_diff, full_restore_diff)``
+
+        ``fix_result_diff`` is a dict with keys ``missing_rows`` / ``extra_rows`` when
+        gold_result_score is 0.0, otherwise empty.
+
+        ``full_restore_diff`` is the human-readable table-level diff string when
+        full_restore_score is 0.0, otherwise empty string.
     """
     import sqlite3
 
@@ -194,7 +201,7 @@ def _evaluate_fix(
             conn.rollback()
             conn.close()
             logger.warning("[Evaluator] record=%d fix SQL execution failed: %s", record.id, exc)
-            return 0.0, 0.0, f"Fix SQL execution failed: {exc}", []
+            return 0.0, 0.0, f"Fix SQL execution failed: {exc}", [], {}, ""
         finally:
             conn.close()
         logger.info("[Evaluator] record=%d fix SQL applied successfully", record.id)
@@ -204,7 +211,7 @@ def _evaluate_fix(
             fixed_result = run_select_query(eval_sandbox, record.gold_sql)
         except Exception as exc:
             logger.warning("[Evaluator] record=%d gold_sql failed on fixed DB: %s", record.id, exc)
-            return 0.0, 0.0, f"gold_sql execution failed on fixed DB: {exc}", []
+            return 0.0, 0.0, f"gold_sql execution failed on fixed DB: {exc}", [], {}, ""
 
         # Compare gold_result (expected) vs fixed_result (actual) as sets of frozenset items
         def _normalize_rows(rows: list[dict]) -> frozenset:
@@ -216,19 +223,27 @@ def _evaluate_fix(
         fixed_set = _normalize_rows(fixed_result)
 
         if gold_set != fixed_set:
+            # Compute row-level diff for detailed analysis
+            missing_rows = [r for r in record.gold_result if tuple(sorted(r.items())) not in fixed_set]
+            extra_rows = [r for r in fixed_result if tuple(sorted(r.items())) not in gold_set]
+            fix_result_diff: dict = {"missing_rows": missing_rows, "extra_rows": extra_rows}
+
             logger.info(
-                "[Evaluator] record=%d gold_sql result mismatch: expected %d row(s), got %d row(s). "
-                "Expected: %s | Actual: %s",
+                "[Evaluator] record=%d gold_sql result mismatch: "
+                "expected %d row(s), got %d row(s). "
+                "Missing rows: %s | Extra rows: %s",
                 record.id,
                 len(record.gold_result),
                 len(fixed_result),
-                str(record.gold_result)[:300],
-                str(fixed_result)[:300],
+                str(missing_rows),
+                str(extra_rows),
             )
-            return 0.0, 0.0, (
+            description = (
                 f"gold_sql result mismatch: expected {len(record.gold_result)} row(s), "
-                f"got {len(fixed_result)} row(s)"
-            ), fixed_result
+                f"got {len(fixed_result)} row(s). "
+                f"Missing: {len(missing_rows)} row(s), extra: {len(extra_rows)} row(s)"
+            )
+            return 0.0, 0.0, description, fixed_result, fix_result_diff, ""
 
         # --- Corruption check: logged but not a hard gate (captured in full_restore_score) ---
         corruption = _check_no_corruption(original_db_path, eval_sandbox, db_base_dir)
@@ -247,17 +262,17 @@ def _evaluate_fix(
         full_match, diff = compare_databases(original_db_path, eval_sandbox)
         if full_match:
             logger.info("[Evaluator] record=%d full restore check: DB fully matches original", record.id)
-            return 1.0, 1.0, "gold_result matches and DB fully restored to original", fixed_result
+            return 1.0, 1.0, "gold_result matches and DB fully restored to original", fixed_result, {}, ""
 
         logger.info(
-            "[Evaluator] record=%d full restore check: partial restore. Diff summary: %s",
-            record.id, str(diff)[:300],
+            "[Evaluator] record=%d full restore check: partial restore. Diff: %s",
+            record.id, diff,
         )
-        return 1.0, 0.0, f"gold_result matches but DB not fully restored (diff: {diff})", fixed_result
+        return 1.0, 0.0, f"gold_result matches but DB not fully restored", fixed_result, {}, diff
 
     except Exception as exc:
         logger.warning("[Evaluator] fix evaluation error for record=%d: %s", record.id, exc)
-        return 0.0, 0.0, f"Evaluation error: {exc}", []
+        return 0.0, 0.0, f"Evaluation error: {exc}", [], {}, ""
     finally:
         if eval_sandbox is not None:
             destroy_sandbox(eval_sandbox)
@@ -348,7 +363,7 @@ def quick_fix_check(
     Returns:
         ``(gold_result_score, full_restore_score, actual_result_after_fix, description)``
     """
-    gold_result_score, full_restore_score, description, actual_result = _evaluate_fix(
+    gold_result_score, full_restore_score, description, actual_result, _, _ = _evaluate_fix(
         record, fix_result, sandbox_dir=sandbox_dir, db_base_dir=db_base_dir
     )
     return gold_result_score, full_restore_score, actual_result, description
@@ -436,10 +451,18 @@ def evaluate(
             "[Evaluator] record=%d FixAgent fallback — DB comparison will likely fail",
             record.id,
         )
+    fix_actual_result: list = []
+    fix_result_diff: dict = {}
+    full_restore_diff: str = ""
     try:
-        gold_result_score, full_restore_score, fix_description, _actual_result = _evaluate_fix(
-            record, fix_result, sandbox_dir=sandbox_dir, db_base_dir=db_base_dir
-        )
+        (
+            gold_result_score,
+            full_restore_score,
+            fix_description,
+            fix_actual_result,
+            fix_result_diff,
+            full_restore_diff,
+        ) = _evaluate_fix(record, fix_result, sandbox_dir=sandbox_dir, db_base_dir=db_base_dir)
     except Exception as exc:
         if error is None:
             error = str(exc)
@@ -453,7 +476,7 @@ def evaluate(
     fix_q_penalty_total = round(_fix_q_penalty * fix_result.query_turns, 4)
     ask_q_penalty_total = round(_ask_q_penalty * fix_result.questions_asked, 4)
     total_penalty = round(expl_penalty + fix_q_penalty_total + ask_q_penalty_total, 4)
-    retry_multiplier = 0.5 if fix_result.retry_count > 0 else 1.0
+    retry_multiplier = 0.5 ** fix_result.retry_count   # 1.0 → 0.5 → 0.25 → … per retry
     final_score = round(max(0.0, gold_result_score - total_penalty) * retry_multiplier, 4)
 
     breakdown = {
@@ -483,6 +506,9 @@ def evaluate(
         gold_result_score=gold_result_score,
         full_restore_score=full_restore_score,
         fix_description=fix_description,
+        fix_actual_result=fix_actual_result,
+        fix_result_diff=fix_result_diff,
+        full_restore_diff=full_restore_diff,
         questions_asked=fix_result.questions_asked,
         explanation_query_turns=explanation_result.query_turns,
         fix_query_turns=fix_result.query_turns,

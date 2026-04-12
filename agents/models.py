@@ -121,6 +121,10 @@ class FixResult(BaseModel):
     questions_asked: int
     query_turns: int = 0    # number of run_query calls made
     retry_count: int = 0    # how many retries were used (0 = first attempt succeeded/failed)
+    fix_attempts: list[str] = Field(
+        default_factory=list,
+        description="fix_sql from every attempt in order (index 0 = initial, 1 = first retry, …)",
+    )
     conversation: list[ConversationTurn]
     is_fallback: bool = False
 
@@ -140,6 +144,22 @@ class EvaluationResult(BaseModel):
     gold_result_score: float        # 0 or 1: does gold_sql return gold_result after fix?
     full_restore_score: float       # 0 or 1: is DB fully restored to original?
     fix_description: str            # human-readable description of fix evaluation result
+    # Detailed fix diff (populated when scores < 1.0 for richer analysis)
+    fix_actual_result: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Rows actually returned by gold_sql after applying fix SQL",
+    )
+    fix_result_diff: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Row-level diff when gold_result_score=0.0: "
+            "{'missing_rows': [...], 'extra_rows': [...]}"
+        ),
+    )
+    full_restore_diff: str = Field(
+        default="",
+        description="Human-readable table-level diff when full_restore_score=0.0",
+    )
     # Tool usage counts
     questions_asked: int
     explanation_query_turns: int = 0        # run_query calls by ExplanationAgent

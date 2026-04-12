@@ -158,43 +158,71 @@ def run_record(
             fix.questions_asked, fix.query_turns, fix.fix_sql,
         )
 
-        # ── Retry if first fix fails the gold check ───────────────────────────
-        if _max_fix_retries > 0 and not fix.is_fallback:
+        # ── Retry loop: re-run FixAgent up to _max_fix_retries times ─────────
+        fix_attempts: list[str] = [fix.fix_sql]   # index 0 = initial attempt
+
+        for retry_num in range(1, _max_fix_retries + 1):
+            # Never retry a fallback — there is no meaningful SQL to improve upon
+            if fix.is_fallback:
+                logger.info(
+                    "FixAgent attempt %d is fallback for record=%d — stopping retry loop",
+                    retry_num - 1, record.id,
+                )
+                break
+
             gold_pre, _, actual_after_fix, _ = quick_fix_check(
                 record=record,
                 fix_result=fix,
                 sandbox_dir=sandbox_dir,
                 db_base_dir=db_base_dir,
             )
-            if gold_pre == 0.0:
+
+            if gold_pre != 0.0:
                 logger.info(
-                    "FixAgent initial fix failed gold check for record=%d — attempting retry 1/%d",
-                    record.id, _max_fix_retries,
+                    "FixAgent attempt %d passed gold check for record=%d — no further retries needed",
+                    retry_num - 1, record.id,
                 )
-                retry_context = (
-                    "Your previous fix SQL was INCORRECT.\n\n"
-                    f"Previous fix SQL:\n{fix.fix_sql}\n\n"
-                    f"After applying it, running the gold SQL returned:\n"
-                    f"{json.dumps(actual_after_fix, default=str)}\n\n"
-                    f"But the expected result is:\n"
-                    f"{json.dumps(record.gold_result, default=str)}\n\n"
-                    "Please produce a new, corrected fix SQL."
-                )
-                fix_agent_retry = FixAgent(
-                    record=record,
-                    explanation=explanation,
-                    llm=fix_llm,
-                    max_turns=max_fix_turns,
-                    question_penalty=_effective_question_penalty,
-                    pipeline_logger=pipeline_logger,
-                    altered_db_path=sandbox_path,
-                )
-                fix_retry = fix_agent_retry.run(user_agent, retry_context=retry_context)
-                fix = fix_retry.model_copy(update={"retry_count": 1})
-                logger.info(
-                    "FixAgent retry complete for record=%d  fix_sql=%s",
-                    record.id, fix.fix_sql,
-                )
+                break
+
+            logger.info(
+                "FixAgent attempt %d FAILED gold check for record=%d — "
+                "starting retry %d/%d  failed_sql=%s",
+                retry_num - 1, record.id, retry_num, _max_fix_retries, fix.fix_sql,
+            )
+            retry_context = (
+                f"Your previous fix SQL (attempt {retry_num - 1}) was INCORRECT.\n\n"
+                f"Previous fix SQL:\n{fix.fix_sql}\n\n"
+                f"After applying it, running the gold SQL returned:\n"
+                f"{json.dumps(actual_after_fix, default=str)}\n\n"
+                f"But the expected result is:\n"
+                f"{json.dumps(record.gold_result, default=str)}\n\n"
+                "Please produce a new, corrected fix SQL."
+            )
+            fix_agent_retry = FixAgent(
+                record=record,
+                explanation=explanation,
+                llm=fix_llm,
+                max_turns=max_fix_turns,
+                question_penalty=_effective_question_penalty,
+                pipeline_logger=pipeline_logger,
+                altered_db_path=sandbox_path,
+            )
+            fix_retry = fix_agent_retry.run(user_agent, retry_context=retry_context)
+            fix_attempts.append(fix_retry.fix_sql)
+            fix = fix_retry.model_copy(update={"retry_count": retry_num})
+            logger.info(
+                "FixAgent retry %d/%d complete for record=%d  fix_sql=%s",
+                retry_num, _max_fix_retries, record.id, fix.fix_sql,
+            )
+        else:
+            # for-loop exhausted without a break — all retries used up
+            logger.warning(
+                "FixAgent exhausted all %d retries for record=%d",
+                _max_fix_retries, record.id,
+            )
+
+        # Attach the full attempt history to the final FixResult
+        fix = fix.model_copy(update={"fix_attempts": fix_attempts})
 
         sample_log.fix_result = fix.model_dump()
 
