@@ -72,6 +72,7 @@ class FixAgent:
                 "gold_sql": record.gold_sql,
                 "altered_result": json.dumps(record.altered_result, default=str),
                 "explanation": explanation.explanation,
+                "sql_impact": explanation.sql_impact or "(not provided)",
                 "alteration_type": explanation.alteration_type,
                 "question_penalty": self._question_penalty,
                 "fix_query_penalty": config.FIX_QUERY_PENALTY,

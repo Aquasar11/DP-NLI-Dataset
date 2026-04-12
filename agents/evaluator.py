@@ -96,7 +96,10 @@ def _judge_explanation(
             "altering_sql": record.altering_sql,
             "targeted_records": json.dumps(record.targeted_records, default=str),
             "alteration_explanation": record.alteration_explanation,
+            "gold_sql": record.gold_sql,
+            "altered_result": json.dumps(record.altered_result, default=str),
             "agent_explanation": explanation_result.explanation,
+            "agent_sql_impact": explanation_result.sql_impact or "(not provided)",
         }
     )
 
@@ -450,7 +453,8 @@ def evaluate(
     fix_q_penalty_total = round(_fix_q_penalty * fix_result.query_turns, 4)
     ask_q_penalty_total = round(_ask_q_penalty * fix_result.questions_asked, 4)
     total_penalty = round(expl_penalty + fix_q_penalty_total + ask_q_penalty_total, 4)
-    final_score = round(max(0.0, gold_result_score - total_penalty), 4)
+    retry_multiplier = 0.5 if fix_result.retry_count > 0 else 1.0
+    final_score = round(max(0.0, gold_result_score - total_penalty) * retry_multiplier, 4)
 
     breakdown = {
         "explanation_query_penalty": expl_penalty,
@@ -462,11 +466,12 @@ def evaluate(
         "[Evaluator] record=%d  alteration_type_score=%.1f  explanation_score=%.2f  "
         "gold_result_score=%.1f  full_restore_score=%.1f  "
         "expl_queries=%d  fix_queries=%d  questions=%d  "
-        "penalty=%.4f (expl=%.4f fix_q=%.4f ask_q=%.4f)  final=%.4f",
+        "penalty=%.4f (expl=%.4f fix_q=%.4f ask_q=%.4f)  retry_multiplier=%.1f  final=%.4f",
         record.id, alteration_type_score, explanation_score,
         gold_result_score, full_restore_score,
         explanation_result.query_turns, fix_result.query_turns, fix_result.questions_asked,
-        total_penalty, expl_penalty, fix_q_penalty_total, ask_q_penalty_total, final_score,
+        total_penalty, expl_penalty, fix_q_penalty_total, ask_q_penalty_total,
+        retry_multiplier, final_score,
     )
 
     return EvaluationResult(
@@ -484,6 +489,7 @@ def evaluate(
         tool_penalty_breakdown=breakdown,
         tool_penalty=total_penalty,
         question_penalty=total_penalty,
+        retry_multiplier=retry_multiplier,
         base_score=gold_result_score,
         final_score=final_score,
         error=error,

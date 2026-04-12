@@ -70,7 +70,7 @@ GOOGLE_CLOUD_LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 SAMPLE_COUNT: int = 10          # 0 = process all samples
 RANDOM_SEED: int = 42
 DELETE_PROBABILITY: float = 0.5  # probability of full-row deletion vs column modification
-MAX_TARGET_RECORDS: int = 2      # max number of result records to alter per sample
+MAX_TARGET_RECORDS: int = 5      # max number of result records to alter per sample
 MAX_RETRIES: int = 3             # retry LLM on validation failure
 
 # ── Logging ────────────────────────────────────────────────────────────────────

@@ -173,6 +173,7 @@ class ExplanationAgent:
 
             elif step.action == "done":
                 explanation = (step.explanation or "").strip()
+                sql_impact = (step.sql_impact or "").strip()
                 alteration_type = (step.alteration_type or "").strip()
 
                 if not explanation:
@@ -180,7 +181,7 @@ class ExplanationAgent:
                     agent_messages.append({
                         "role": "user",
                         "content": (
-                            "Please provide a complete explanation and alteration_type before finishing."
+                            "Please provide a complete explanation, sql_impact, and alteration_type before finishing."
                         ),
                     })
                     continue
@@ -192,6 +193,7 @@ class ExplanationAgent:
                 return ExplanationResult(
                     record_id=self._record.id,
                     explanation=explanation,
+                    sql_impact=sql_impact,
                     alteration_type=alteration_type,
                     turns_used=turns_used,
                     query_turns=turns_used,
@@ -210,6 +212,7 @@ class ExplanationAgent:
         return ExplanationResult(
             record_id=self._record.id,
             explanation="Agent reached maximum turns without producing an explanation.",
+            sql_impact="",
             alteration_type="",
             turns_used=turns_used,
             query_turns=turns_used,

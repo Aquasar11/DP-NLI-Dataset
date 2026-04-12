@@ -83,14 +83,20 @@ The user noticed this and raised a concern:
 
 ━━━ YOUR GOAL ━━━
 Independently discover WHAT changed in the database (which table, which rows, \
-which columns) that caused the query to return an unexpected result.
+which columns) that caused the query to return an unexpected result. Then explain \
+WHY that change causes the SQL query to return different results — identify the \
+specific query condition (WHERE clause, JOIN, HAVING, DISTINCT, aggregation, etc.) \
+that the altered data no longer satisfies.
 
 You must do your own investigation — do not assume anything without evidence.
 
 Investigation strategy:
 1. First inspect the database schema and data directly using run_query.
 2. Compare what you observe against the expected query result to identify gaps.
-3. Once you have enough evidence, submit your explanation.
+3. Study the SQL query carefully — understand which condition or join the missing \
+   record would need to satisfy.
+4. Once you have enough evidence, submit your explanation including both what \
+   changed and why the SQL no longer returns the affected record.
 
 You must work fully autonomously using only the run_query tool. Do not attempt \
 to ask questions — gather all information through database queries.
@@ -98,7 +104,7 @@ to ask questions — gather all information through database queries.
 ━━━ TOOLS AVAILABLE ━━━
 You have one tool:
 
-**run_query** — Execute a SELECT query directly on the (modified) database.
+**run_query** — Execute a SELECT query directly on the database.
 Use this to inspect table contents, count rows, filter data, etc.
 You do NOT need permission; just run the query.
 
@@ -112,8 +118,8 @@ To run a SELECT query on the database:
 To submit your final explanation (after gathering enough evidence):
 {{
   "action": "done",
-  "explanation": "<full explanation: which table/rows/columns changed and how \
-it caused the unexpected query result>",
+  "explanation": "<what physically changed: which table, which rows/columns, and what the new values are>",
+  "sql_impact": "<why the change causes the SQL query to return different results — which specific condition (WHERE, JOIN, HAVING, DISTINCT, etc.) the altered data no longer satisfies; e.g. 'the score column was changed from 100 to 50; the query filters WHERE score = 100 so the record is excluded'>",
   "alteration_type": "<exactly 'deletion' if rows were deleted, or 'modification' if rows were updated>"
 }}
 
@@ -144,6 +150,9 @@ The user noticed this and raised a concern:
 ━━━ INVESTIGATION FINDINGS ━━━
 Explanation from the investigation:
 {explanation}
+
+Why the SQL query result changed:
+{sql_impact}
 
 Alteration type identified:
 {alteration_type}
@@ -205,6 +214,12 @@ You are an expert evaluator assessing the quality of a database investigator's \
 explanation.
 
 ━━━ GROUND TRUTH ━━━
+The SQL query whose result changed:
+{gold_sql}
+
+Current (unexpected) query result:
+{altered_result}
+
 The actual SQL modification that was applied to the database:
 {altering_sql}
 
@@ -215,29 +230,34 @@ Official description of the change:
 {alteration_explanation}
 
 ━━━ INVESTIGATOR'S EXPLANATION ━━━
-Explanation provided by the investigator:
+What the investigator says changed in the database:
 {agent_explanation}
+
+Why the investigator says the SQL result changed:
+{agent_sql_impact}
 
 ━━━ YOUR TASK ━━━
 Evaluate whether the investigator's explanation accurately and completely \
-describes the actual database change. Note: the alteration type classification \
-(deletion vs modification) is evaluated separately — focus here on whether the \
-explanation correctly identifies the affected table, rows, and columns. \
-Reason step-by-step before assigning a score.
+describes both (a) what physically changed in the database and (b) why that \
+change causes the SQL query to return different results. Note: the alteration \
+type classification (deletion vs modification) is evaluated separately — focus \
+here on the correctness of the physical change description and the SQL-logic \
+reasoning. Reason step-by-step before assigning a score.
 
 Scoring — assign exactly one of these three values:
-- 1.0 (Totally correct): The explanation correctly identifies the affected \
-  table, the nature of the change (deletion vs update), and approximately \
-  which rows were affected.
-- 0.5 (Partially correct): The explanation identifies the right general area \
-  (e.g. correct table or correct type of change) but gets key details wrong \
-  or is incomplete.
-- 0.0 (Totally wrong): The explanation is completely incorrect, irrelevant, \
-  or fails to identify any meaningful aspect of the actual change.
+- 1.0 (Totally correct): Correctly identifies what changed (affected table, \
+  rows/columns) AND correctly explains why the SQL query no longer returns the \
+  expected records — identifies the specific condition (WHERE clause, JOIN, \
+  HAVING, DISTINCT, aggregation, etc.) that the altered data no longer satisfies.
+- 0.5 (Partially correct): Correctly identifies what changed but the SQL-impact \
+  explanation is vague, incomplete, or missing; OR correctly identifies the SQL \
+  impact but misidentifies what physically changed.
+- 0.0 (Totally wrong): Fails to identify what changed, or both the alteration \
+  description and the SQL-impact reasoning are incorrect or irrelevant.
 
 ━━━ RESPONSE FORMAT (always JSON) ━━━
 {{
-  "reasoning": "<step-by-step reasoning, then your final score assignment>"
-  "score": <0.0, 0.5, or 1.0>,
+  "reasoning": "<step-by-step reasoning, then your final score assignment>",
+  "score": <0.0, 0.5, or 1.0>
 }}
 """

@@ -46,7 +46,11 @@ class ExplanationAgentStep(BaseModel):
     )
     explanation: str | None = Field(
         None,
-        description="Full explanation of what changed in the data (required when action='done')",
+        description="What physically changed in the data: which table, which rows/columns, and what the new values are (required when action='done')",
+    )
+    sql_impact: str | None = Field(
+        None,
+        description="Why the alteration causes the SQL query to return different results — which specific condition (WHERE, JOIN, HAVING, DISTINCT, etc.) the altered data no longer satisfies (required when action='done')",
     )
     alteration_type: str | None = Field(
         None,
@@ -99,6 +103,7 @@ class ExplanationResult(BaseModel):
 
     record_id: int
     explanation: str
+    sql_impact: str = ""    # why the alteration causes the SQL query to return different results
     alteration_type: str
     turns_used: int
     query_turns: int = 0    # number of run_query calls made
@@ -142,8 +147,9 @@ class EvaluationResult(BaseModel):
     tool_penalty_breakdown: dict = Field(default_factory=dict)
     tool_penalty: float             # total deduction across all tool uses
     question_penalty: float = 0.0  # backward-compat alias (equal to tool_penalty)
+    retry_multiplier: float = 1.0  # 0.5 if fix used a retry attempt, else 1.0
     base_score: float               # same as gold_result_score
-    final_score: float              # max(0, gold_result_score - tool_penalty)
+    final_score: float              # max(0, gold_result_score - tool_penalty) * retry_multiplier
     error: str | None = None
 
 
