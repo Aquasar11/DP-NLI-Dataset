@@ -142,6 +142,79 @@ def validate_alteration(
     )
 
 
+def validate_alteration_insert(
+    gold_result: list[dict[str, Any]],
+    altered_result: list[dict[str, Any]],
+    has_limit: bool = False,
+) -> ValidationResult:
+    """
+    Validate that an INSERT alteration produced the intended result.
+
+    Hard requirement: the query result must have changed after the INSERT.
+
+    For LIMIT queries an additional hard requirement applies: at least one
+    original row must have been displaced (pushed out) by the inserted rows,
+    since the point of the alteration is that something visible changed.
+
+    Args:
+        gold_result: The original query result before alteration.
+        altered_result: The query result after alteration.
+        has_limit: Whether the gold SQL contains a LIMIT clause.
+
+    Returns:
+        ValidationResult with is_valid and details about new/displaced records.
+    """
+    errors: list[str] = []
+
+    gold_keys = {_row_to_key(r) for r in gold_result}
+    altered_keys = {_row_to_key(r) for r in altered_result}
+
+    new_records = [r for r in altered_result if _row_to_key(r) not in gold_keys]
+    displaced_records = [r for r in gold_result if _row_to_key(r) not in altered_keys]
+
+    # Hard requirement: the result must have changed
+    if gold_keys == altered_keys:
+        errors.append("Altered result is identical to gold result — INSERT had no effect")
+
+    # For LIMIT queries: inserted rows must push at least one original row out
+    if has_limit and not displaced_records:
+        errors.append(
+            "LIMIT query: no original rows were displaced by the insertion. "
+            "The inserted rows must rank high enough to push existing rows out of the result."
+        )
+
+    if new_records:
+        logger.info(
+            "%d new record(s) appeared in altered result: %s",
+            len(new_records),
+            json.dumps(new_records[:5], ensure_ascii=False, default=str),
+        )
+    if displaced_records:
+        logger.info(
+            "%d original record(s) displaced by insertion: %s",
+            len(displaced_records),
+            json.dumps(displaced_records[:5], ensure_ascii=False, default=str),
+        )
+
+    is_valid = len(errors) == 0
+    error_message = " | ".join(errors) if errors else None
+
+    if is_valid:
+        logger.debug(
+            "INSERT validation passed: %d new record(s), %d displaced",
+            len(new_records), len(displaced_records),
+        )
+    else:
+        logger.debug("INSERT validation failed: %s", error_message)
+
+    return ValidationResult(
+        is_valid=is_valid,
+        error_message=error_message,
+        new_records=new_records,
+        displaced_records=displaced_records,
+    )
+
+
 def validate_alteration_aggregate(
     gold_result: list[dict[str, Any]],
     altered_result: list[dict[str, Any]],
@@ -194,3 +267,15 @@ def is_aggregate_query(sql: str) -> bool:
         return True
 
     return False
+
+
+def has_limit_clause(sql: str) -> bool:
+    """
+    Heuristic to detect if a SQL query contains a LIMIT clause.
+    Ignores content inside comments.
+    """
+    # Strip single-line comments
+    sql_clean = " ".join(
+        line.split("--")[0] for line in sql.splitlines()
+    )
+    return "LIMIT" in sql_clean.upper()

@@ -97,7 +97,13 @@ def parse_args() -> argparse.Namespace:
         "--delete-prob",
         type=float,
         default=config.DELETE_PROBABILITY,
-        help="Probability of full-row deletion vs column modification (0.0 - 1.0)",
+        help="Probability of full-row deletion (0.0 - 1.0)",
+    )
+    parser.add_argument(
+        "--insert-prob",
+        type=float,
+        default=config.INSERT_PROBABILITY,
+        help="Probability of corrupted-row insertion (0.0 - 1.0). Remainder = modify.",
     )
     parser.add_argument(
         "--max-targets",
@@ -230,12 +236,22 @@ def main() -> None:
             temperature=args.temperature,
         )
 
+    # ── Validate probability split ────────────────────────────────────────
+    if args.delete_prob + args.insert_prob > 1.0:
+        logger.error(
+            "--delete-prob (%.2f) + --insert-prob (%.2f) = %.2f > 1.0. "
+            "They must sum to at most 1.0 (remainder goes to modify).",
+            args.delete_prob, args.insert_prob, args.delete_prob + args.insert_prob,
+        )
+        sys.exit(1)
+
     pipeline = Pipeline(
         db_manager=db_manager,
         llm_client=llm_client,
         dataset=dataset,
         sample_count=args.samples,
         delete_probability=args.delete_prob,
+        insert_probability=args.insert_prob,
         max_target_records=args.max_targets,
         max_retries=args.max_retries,
         seed=args.seed,
@@ -247,6 +263,8 @@ def main() -> None:
     logger.info("Model: %s", llm_client.model)
     logger.info("Samples: %s", args.samples if args.samples > 0 else "ALL")
     logger.info("Delete probability: %.2f", args.delete_prob)
+    logger.info("Insert probability: %.2f", args.insert_prob)
+    logger.info("Modify probability: %.2f", 1.0 - args.delete_prob - args.insert_prob)
     logger.info("Max target records: %d", args.max_targets)
     logger.info("Max retries: %d", args.max_retries)
     logger.info("Random seed: %d", args.seed)

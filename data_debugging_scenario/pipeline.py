@@ -43,6 +43,8 @@ from prompts import (
     build_aggregate_retry_prompt,
     build_alteration_prompt,
     build_followup_prompt,
+    build_insert_alteration_prompt,
+    build_insert_retry_prompt,
     build_retry_prompt,
 )
 from sample_logger import (
@@ -54,9 +56,11 @@ from sample_logger import (
     make_llm_call_log,
 )
 from validator import (
+    has_limit_clause,
     is_aggregate_query,
     validate_alteration,
     validate_alteration_aggregate,
+    validate_alteration_insert,
 )
 
 logger = logging.getLogger(__name__)
@@ -173,6 +177,7 @@ class Pipeline:
         dataset: str = "bird_train",
         sample_count: int | None = None,
         delete_probability: float | None = None,
+        insert_probability: float | None = None,
         max_target_records: int | None = None,
         max_retries: int | None = None,
         seed: int | None = None,
@@ -189,6 +194,9 @@ class Pipeline:
         self.sample_count = sample_count if sample_count is not None else config.SAMPLE_COUNT
         self.delete_prob = (
             delete_probability if delete_probability is not None else config.DELETE_PROBABILITY
+        )
+        self.insert_prob = (
+            insert_probability if insert_probability is not None else config.INSERT_PROBABILITY
         )
         self.max_targets = (
             max_target_records if max_target_records is not None else config.MAX_TARGET_RECORDS
@@ -249,6 +257,7 @@ class Pipeline:
         sample_idx: int,
         is_aggregate: bool = False,
         rng: random.Random | None = None,
+        force_non_insert: bool = False,
     ) -> tuple[AlterationDecision, AlterationDecisionLog]:
         """
         Randomly decide the alteration strategy and log every factor.
@@ -262,25 +271,52 @@ class Pipeline:
         Returns both the AlterationDecision and a detailed AlterationDecisionLog.
         """
         _rng = rng if rng is not None else self.rng
-        # Draw random value and decide delete vs. modify
+        # Draw random value and decide alteration type
         rand_draw = _rng.random()
-        if rand_draw < self.delete_prob:
-            alt_type = AlterationType.DELETE
+        if force_non_insert:
+            # Fallback path: distribute proportionally between DELETE and MODIFY only
+            delete_weight = self.delete_prob
+            modify_weight = max(0.0, 1.0 - self.delete_prob - self.insert_prob)
+            total_weight = delete_weight + modify_weight
+            delete_threshold = (delete_weight / total_weight) if total_weight > 0 else 0.5
+            alt_type = AlterationType.DELETE if rand_draw < delete_threshold else AlterationType.MODIFY
+            logger.warning(
+                "[%d] INSERT-FALLBACK decision: rand_draw=%.4f, delete_threshold=%.4f → %s",
+                sample_idx, rand_draw, delete_threshold, alt_type.value.upper(),
+            )
         else:
-            alt_type = AlterationType.MODIFY
-
-        logger.info(
-            "[%d] Decision — alteration type: rand_draw=%.4f, delete_prob=%.2f → %s",
-            sample_idx, rand_draw, self.delete_prob, alt_type.value.upper(),
-        )
+            if rand_draw < self.delete_prob:
+                alt_type = AlterationType.DELETE
+            elif rand_draw < self.delete_prob + self.insert_prob:
+                alt_type = AlterationType.INSERT
+            else:
+                alt_type = AlterationType.MODIFY
+            logger.info(
+                "[%d] Decision — alteration type: rand_draw=%.4f, delete_prob=%.2f, "
+                "insert_prob=%.2f → %s",
+                sample_idx, rand_draw, self.delete_prob, self.insert_prob,
+                alt_type.value.upper(),
+            )
 
         num_result_rows = len(gold_result)
 
-        if is_aggregate:
+        if alt_type == AlterationType.INSERT:
+            # For INSERT: no pre-existing target rows.  num_targets = how many rows to insert.
+            # targeted_records will be computed post-hoc after sandbox validation.
+            num_targets = _rng.randint(1, self.max_targets)
+            target_indices: list[int] = []
+            targeted_records: list[dict[str, Any]] = []
+            if is_aggregate:
+                targeted_records = [gold_result[0]]  # the aggregate value that should change
+            logger.info(
+                "[%d] Decision (INSERT) — num_rows_to_insert=%d, is_aggregate=%s",
+                sample_idx, num_targets, is_aggregate,
+            )
+        elif is_aggregate:
             # For aggregate queries num_targets = number of underlying rows to alter;
             # the single aggregate result row is always the "targeted" record.
             num_targets = _rng.randint(1, self.max_targets)
-            target_indices: list[int] = []
+            target_indices = []
             targeted_records = [gold_result[0]]
             logger.info(
                 "[%d] Decision (aggregate) — max_targets_config=%d, "
@@ -313,6 +349,8 @@ class Pipeline:
             target_record_indices=target_indices,
             targeted_records=targeted_records,
             delete_probability_config=self.delete_prob,
+            insert_probability_config=self.insert_prob,
+            force_non_insert=force_non_insert,
             random_draw=round(rand_draw, 6),
         )
         return decision, decision_log
@@ -323,6 +361,8 @@ class Pipeline:
         self,
         sample: BirdSample,
         sample_idx: int,
+        _force_non_insert: bool = False,
+        _insert_fallback_warning: str | None = None,
     ) -> DatasetRecord | None:
         """
         Process a single BIRD sample through the full pipeline.
@@ -330,10 +370,17 @@ class Pipeline:
         Every decision, LLM call, and validation result is captured in a
         SampleLog and written incrementally via SampleLogger.
         Returns a DatasetRecord on success, None on skip/failure.
+
+        Args:
+            _force_non_insert: When True (fallback after INSERT failure), skip INSERT
+                and choose between DELETE and MODIFY only.
+            _insert_fallback_warning: Warning string written into the sample log to
+                indicate this run is a fallback after INSERT exhausted all retries.
         """
         # Per-sample RNG: deterministic per index, isolated across threads
         sample_rng = random.Random(self.seed + sample_idx)
-        self.stats.processed += 1
+        if not _force_non_insert:
+            self.stats.processed += 1
         t_start = time.perf_counter()
         ts_start = datetime.datetime.utcnow().isoformat() + "Z"
 
@@ -363,6 +410,7 @@ class Pipeline:
             step1_passed=False,
             step2_llm_call=None,
             step2_follow_up_question=None,
+            insert_fallback_warning=_insert_fallback_warning,
             step2_passed=False,
             total_duration_seconds=0.0,
             timestamp_start=ts_start,
@@ -420,9 +468,17 @@ class Pipeline:
 
         # ── 5. Alteration decision ─────────────────────────────────────────
         decision, decision_log = self.make_alteration_decision(
-            gold_result, sample_idx, is_aggregate=is_aggregate, rng=sample_rng
+            gold_result, sample_idx,
+            is_aggregate=is_aggregate,
+            rng=sample_rng,
+            force_non_insert=_force_non_insert,
         )
-        targeted_records = [gold_result[i] for i in decision.target_record_indices]
+        if decision.alteration_type == AlterationType.INSERT:
+            # For INSERT, targeted_records are empty upfront (computed post-hoc)
+            targeted_records = decision_log.targeted_records
+        else:
+            targeted_records = [gold_result[i] for i in decision.target_record_indices]
+        has_limit = has_limit_clause(sample.SQL)
         base["alteration_decision"] = decision_log
 
         # ── 6. Retrieve DDL ───────────────────────────────────────────────
@@ -451,6 +507,7 @@ class Pipeline:
             )
 
             # Build prompt
+            _is_insert = decision.alteration_type == AlterationType.INSERT
             if attempt == 1:
                 if is_aggregate:
                     prompt = build_aggregate_alteration_prompt(
@@ -459,6 +516,14 @@ class Pipeline:
                         gold_result=gold_result,
                         alteration_type=decision.alteration_type,
                         num_targets=num_targets,
+                    )
+                elif _is_insert:
+                    prompt = build_insert_alteration_prompt(
+                        gold_sql=sample.SQL,
+                        db_ddl=db_ddl,
+                        gold_result=gold_result,
+                        num_inserts=num_targets,
+                        has_limit=has_limit,
                     )
                 else:
                     prompt = build_alteration_prompt(
@@ -482,6 +547,20 @@ class Pipeline:
                         altered_result=prev_altered_result,
                         alteration_type=decision.alteration_type,
                         num_targets=num_targets,
+                    )
+                elif _is_insert:
+                    prompt = build_insert_retry_prompt(
+                        previous_altering_sql=prev_altering_sql,
+                        previous_explanation=prev_explanation,
+                        error_message=(
+                            final_validation.error_message if final_validation else "Unknown"
+                        ),
+                        gold_sql=sample.SQL,
+                        db_ddl=db_ddl,
+                        gold_result=gold_result,
+                        altered_result=prev_altered_result,
+                        num_inserts=num_targets,
+                        has_limit=has_limit,
                     )
                 else:
                     prompt = build_retry_prompt(
@@ -598,6 +677,12 @@ class Pipeline:
                             gold_result=gold_result,
                             altered_result=altered_result,
                         )
+                    elif _is_insert:
+                        this_validation = validate_alteration_insert(
+                            gold_result=gold_result,
+                            altered_result=altered_result,
+                            has_limit=has_limit,
+                        )
                     else:
                         this_validation = validate_alteration(
                             gold_result=gold_result,
@@ -610,7 +695,11 @@ class Pipeline:
                             "[%d] ✓ Validation PASSED — %s",
                             sample_idx,
                             "aggregate result changed" if is_aggregate
-                            else f"{len(this_validation.missing_targeted)} targeted record(s) removed",
+                            else (
+                                f"{len(this_validation.new_records)} new record(s) inserted"
+                                if _is_insert
+                                else f"{len(this_validation.missing_targeted)} targeted record(s) removed"
+                            ),
                         )
                     else:
                         logger.info(
@@ -664,6 +753,13 @@ class Pipeline:
             if this_validation.is_valid:
                 final_alteration_result = alteration_response
                 final_altered_result = altered_result
+                # For INSERT: compute targeted_records post-hoc (the new rows)
+                if _is_insert and not is_aggregate:
+                    targeted_records = this_validation.new_records
+                    logger.info(
+                        "[%d] INSERT post-hoc targeted_records: %d new row(s)",
+                        sample_idx, len(targeted_records),
+                    )
                 break
 
         base["step1_attempts"] = step1_attempts
@@ -682,6 +778,22 @@ class Pipeline:
                 "[%d] Step 1 FAILED after %d attempt(s): %s",
                 sample_idx, len(step1_attempts), reason,
             )
+
+            # INSERT fallback: if this was an INSERT attempt (not already a fallback),
+            # re-run the sample with DELETE or MODIFY instead of logging a failure.
+            if _is_insert and not _force_non_insert:
+                warning_msg = (
+                    f"INSERT failed after {self.max_retries} attempt(s) "
+                    f"({reason}); re-running with DELETE or MODIFY"
+                )
+                logger.warning("[%d] %s", sample_idx, warning_msg)
+                return self.process_sample(
+                    sample,
+                    sample_idx,
+                    _force_non_insert=True,
+                    _insert_fallback_warning=warning_msg,
+                )
+
             self.stats.failed_validation += 1
             base["step1_passed"] = False
             _emit(

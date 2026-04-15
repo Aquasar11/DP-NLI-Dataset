@@ -60,14 +60,16 @@ class AttemptLog:
 class AlterationDecisionLog:
     """Captures every factor that went into the alteration decision."""
 
-    alteration_type: str  # "delete" | "modify"
+    alteration_type: str  # "delete" | "modify" | "insert"
     num_result_rows: int
     max_targets_config: int
     num_targets_chosen: int
     target_record_indices: list[int]
     targeted_records: list[dict[str, Any]]
     delete_probability_config: float
-    random_draw: float
+    insert_probability_config: float = 0.0
+    force_non_insert: bool = False
+    random_draw: float = 0.0
 
 
 # ── Top-level per-sample record ────────────────────────────────────────────
@@ -111,6 +113,8 @@ class SampleLog:
     skip_reason: str | None = None
     total_duration_seconds: float = 0.0
     timestamp_start: str = ""
+    # Set when this run is a fallback after INSERT failed all its retries
+    insert_fallback_warning: str | None = None
 
 
 # ── Helper factories ───────────────────────────────────────────────────────

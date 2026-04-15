@@ -65,6 +65,8 @@ def _evaluate_alteration_type(
             return "delete"
         if t in ("modification", "modify", "update"):
             return "modify"
+        if t in ("insertion", "insert"):
+            return "insert"
         return t
 
     predicted = _normalize(explanation_result.alteration_type)

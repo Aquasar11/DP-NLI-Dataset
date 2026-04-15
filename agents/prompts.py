@@ -93,10 +93,12 @@ You must do your own investigation — do not assume anything without evidence.
 Investigation strategy:
 1. First inspect the database schema and data directly using run_query.
 2. Compare what you observe against the expected query result to identify gaps.
-3. Study the SQL query carefully — understand which condition or join the missing \
-   record would need to satisfy.
-4. Once you have enough evidence, submit your explanation including both what \
-   changed and why the SQL no longer returns the affected record.
+3. Consider all possibilities: rows may have been deleted, column values may have \
+   been modified, or new corrupted rows may have been inserted into the database.
+4. Study the SQL query carefully — understand which condition or join is affected \
+   by the data change.
+5. Once you have enough evidence, submit your explanation including both what \
+   changed and why the SQL returns different results.
 
 You must work fully autonomously using only the run_query tool. Do not attempt \
 to ask questions — gather all information through database queries.
@@ -123,7 +125,7 @@ To submit your final explanation (after gathering enough evidence):
   "action": "done",
   "explanation": "<what physically changed: which table, which rows/columns, and what the new values are>",
   "sql_impact": "<why the change causes the SQL query to return different results — which specific condition (WHERE, JOIN, HAVING, DISTINCT, etc.) the altered data no longer satisfies; e.g. 'the score column is 50; the query filters WHERE score = 100 so the record is excluded'>",
-  "alteration_type": "<exactly 'deletion' if rows were deleted, or 'modification' if rows were updated>"
+  "alteration_type": "<exactly 'deletion' if rows were deleted, 'modification' if rows were updated, or 'insertion' if new phantom rows were added to the database>"
 }}
 
 ━━━ DATABASE SCHEMA ━━━
@@ -168,6 +170,8 @@ Examples of what this means:
 - If rows were DELETED → write INSERT statements to re-add the exact original rows.
 - If rows were UPDATED with wrong values → write UPDATE statements to restore \
   the original values.
+- If rows were INSERTED (phantom records were added) → write DELETE \
+  statements to remove the injected rows from the database.
 
 Your SQL must be precise:
 - Use exact column names and values.

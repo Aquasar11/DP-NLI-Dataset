@@ -29,13 +29,14 @@ def _format_rows(rows: list[dict[str, Any]], max_rows: int = 30) -> str:
 def _format_targeted(
     targeted_records: list[dict[str, Any]],
     alteration_type: AlterationType,
+    num_inserts: int = 1,
 ) -> str:
     """Describe the targeted records and what should happen to them."""
     parts = []
     for i, rec in enumerate(targeted_records):
         parts.append(f"  Record {i + 1}: {json.dumps(rec, ensure_ascii=False, default=str)}")
 
-    target_desc = "\n".join(parts)
+    target_desc = "\n".join(parts) if parts else "(no specific target records — you will INSERT new ones)"
 
     if alteration_type == AlterationType.DELETE:
         action = (
@@ -43,6 +44,24 @@ def _format_targeted(
             "appear in the query result.\n"
             'In the response, set "target_columns" to ["all"].'
         )
+    elif alteration_type == AlterationType.INSERT:
+        action = (
+            f"INSERT approximately {num_inserts} new row(s) into the relevant table(s) "
+            "so that the new row(s) APPEAR in the query result when the gold SQL is "
+            "re-executed.\n"
+            "CRITICAL: You MUST use INSERT statements. NEVER use DELETE or UPDATE.\n"
+            "RULES FOR INSERTED DATA:\n"
+            "1. The inserted rows MUST satisfy the gold query's filtering conditions "
+            "(WHERE, JOIN, HAVING) so they appear in the result.\n"
+            "2. The inserted data MUST look realistic and normal — like a legitimate record "
+            "that belongs in the database. Use plausible names, realistic values, and "
+            "appropriate data types. The row should be indistinguishable from real data.\n"
+            "3. Use primary key values that do NOT conflict with existing data. "
+            "Pick a very large ID (e.g., 999999) or check the schema for the next safe value.\n"
+            "4. Respect NOT NULL constraints and foreign key relationships — the INSERT "
+            "must execute successfully.\n"
+            'In the response, set "target_columns" to ["all"].\n\n'
+        ) + INSERT_EXAMPLES
     else:
         action = (
             "MODIFY one or more columns of the above record(s) using UPDATE "
@@ -104,16 +123,40 @@ from the filtered result.\
 """
 
 
+INSERT_EXAMPLES = """\
+Examples of correct INSERT behavior:
+
+Example 1 — Gold SQL: SELECT name, age FROM employees WHERE department = 'Engineering'
+  GOOD: INSERT INTO employees (employee_id, name, age, department) VALUES (999999, 'Alex Johnson', 34, 'Engineering');
+  BAD:  INSERT INTO employees (employee_id, name, age, department) VALUES (1, 'Alex Johnson', 34, 'Engineering');
+  Why: The inserted row should look like a real employee and satisfy the WHERE condition. \
+The bad example uses employee_id=1 which likely already exists (PK conflict).
+
+Example 2 — Gold SQL: SELECT T1.name, T2.score FROM students AS T1 JOIN scores AS T2 ON T1.id = T2.student_id WHERE T2.score >= 90
+  GOOD: INSERT INTO students (id, name) VALUES (999999, 'Maria Chen'); INSERT INTO scores (student_id, score) VALUES (999999, 94);
+  BAD:  INSERT INTO scores (student_id, score) VALUES (1, 95);
+  Why: Both tables need rows for the JOIN. Use realistic-looking values. \
+The bad example uses an existing student_id (FK conflict) and doesn't add the student row.
+
+Example 3 — Gold SQL: SELECT product_name, price FROM products WHERE category = 'Electronics' AND price < 1000
+  GOOD: INSERT INTO products (product_id, product_name, price, category) VALUES (999999, 'Smart Speaker Pro', 89.99, 'Electronics');
+  BAD:  INSERT INTO products (product_id, product_name, price, category) VALUES (7, 'Speaker', 89.99, 'Electronics');
+  Why: Use a realistic product name and price satisfying the WHERE conditions. \
+The bad example conflicts with an existing product_id.\
+"""
+
+
 # ── Step 1: Alteration SQL Prompt ──────────────────────────────────────────────
 
 ALTERATION_SYSTEM_PROMPT = """\
 You are a database expert. Your task is to write SQL statements that alter a \
-database so that specific records disappear from a query's result.
+database so that a query's result changes.
 
 RULES:
-1. Only output valid SQLite-compatible SQL (DELETE or UPDATE statements).
+1. Only output valid SQLite-compatible SQL (DELETE, UPDATE, or INSERT statements).
 2. NEVER switch between operation types. If the required action says MODIFY, \
-you MUST use UPDATE — never DELETE. If it says DELETE, use DELETE.
+you MUST use UPDATE — never DELETE or INSERT. If it says DELETE, use DELETE. \
+If it says INSERT, use INSERT.
 3. In WHERE clauses, use primary keys or unique identifiers to target exact rows.
 4. For UPDATE (modify) operations — column selection priority:
    a. BEST: Modify attribute columns in the gold query's WHERE, JOIN, HAVING, \
@@ -122,14 +165,17 @@ or aggregate conditions (e.g., score, age, status, amount, date, color, salary).
 columns in the SELECT clause to change the returned values.
    c. LAST RESORT: Only if no other columns work, modify identifier/primary \
 key columns used in conditions.
-5. If the query involves JOINs, identify which table's row needs to change.
-6. Multiple SQL statements should be separated by semicolons.
+5. For INSERT operations — the inserted rows must look realistic and normal, \
+like legitimate records that belong in the database. They must satisfy the \
+query's conditions so they appear in the result.
+6. If the query involves JOINs, identify which table's row needs to change.
+7. Multiple SQL statements should be separated by semicolons.
 
 OUTPUT FORMAT — respond with valid JSON only:
 {
   "altering_sql": "<SQL statement(s)>",
   "target_columns": ["<column1>", "<column2>"],
-  "explanation": "<why this alteration removes the targeted records from the result>"
+  "explanation": "<why this alteration changes the query result>"
 }\
 """
 
@@ -175,6 +221,54 @@ Respond with JSON only.\
 """
 
 
+def build_insert_alteration_prompt(
+    *,
+    gold_sql: str,
+    db_ddl: str,
+    gold_result: list[dict[str, Any]],
+    num_inserts: int = 1,
+    has_limit: bool = False,
+) -> str:
+    """Build the user prompt for Step 1 when the alteration type is INSERT."""
+    _, action = _format_targeted(
+        [], AlterationType.INSERT, num_inserts=num_inserts,
+    )
+
+    limit_note = ""
+    if has_limit:
+        limit_note = (
+            "\n**IMPORTANT — LIMIT query:** This query uses a LIMIT clause. Your inserted "
+            "rows MUST be ranked high enough (by ORDER BY or natural row order) to appear "
+            "within the LIMIT, thereby pushing at least one existing row out of the result. "
+            "Choose values that will sort ahead of the existing rows.\n"
+        )
+
+    return f"""\
+## Database Schema (DDL)
+```sql
+{db_ddl}
+```
+
+## Gold SQL Query
+```sql
+{gold_sql}
+```
+
+## Current Query Result ({len(gold_result)} rows)
+{_format_rows(gold_result)}
+{limit_note}
+## Required Action
+{action}
+
+Write INSERT SQL statement(s) that add new realistic-looking row(s) to the \
+database so that when the gold SQL query is re-executed, the new row(s) appear \
+in the result. The inserted data must satisfy the query's filtering conditions \
+and must look like a legitimate record belonging in this database.
+
+Respond with JSON only.\
+"""
+
+
 # ── Step 1: Aggregate Alteration Prompt ───────────────────────────────────────
 
 AGGREGATE_ALTERATION_SYSTEM_PROMPT = """\
@@ -183,17 +277,20 @@ underlying table data so that an aggregate SQL query returns a DIFFERENT value \
 than it currently does.
 
 RULES:
-1. Only output valid SQLite-compatible SQL (DELETE or UPDATE statements).
+1. Only output valid SQLite-compatible SQL (DELETE, UPDATE, or INSERT statements).
 2. NEVER switch between operation types. If the required action says MODIFY, \
-you MUST use UPDATE — never DELETE. If it says DELETE, use DELETE.
+you MUST use UPDATE — never DELETE or INSERT. If it says DELETE, use DELETE. \
+If it says INSERT, use INSERT.
 3. Your alteration must change the output of the aggregate query — the new \
 aggregate result must differ from the original one.
-4. Aim to modify or delete approximately the requested number of underlying rows.
+4. Aim to modify, delete, or insert approximately the requested number of underlying rows.
 5. In WHERE clauses, use primary keys or unique identifiers to target exact \
 rows. For UPDATE statements, prefer modifying attribute columns (score, amount, \
 date, status, etc.) over identifiers. Only change identifiers as a last resort.
-6. If the query involves JOINs, identify which table's rows need to change.
-7. Multiple SQL statements should be separated by semicolons.
+6. For INSERT operations, the inserted rows should look corrupted (NULLs, \
+implausible values) while still being counted/summed/averaged by the query.
+7. If the query involves JOINs, identify which table's rows need to change.
+8. Multiple SQL statements should be separated by semicolons.
 
 OUTPUT FORMAT — respond with valid JSON only:
 {
@@ -219,6 +316,16 @@ def build_aggregate_alteration_prompt(
             f"table(s) so that the aggregate result changes.\n"
             'In the response, set "target_columns" to ["all"].'
         )
+    elif alteration_type == AlterationType.INSERT:
+        action = (
+            f"INSERT approximately {num_targets} new row(s) into the relevant table(s) "
+            "so that the aggregate result changes (e.g., COUNT increases, SUM/AVG shifts).\n"
+            "The inserted data must look realistic and normal — like legitimate records "
+            "that belong in the database. Use plausible values appropriate for the domain.\n"
+            "The rows must satisfy the query's conditions so they are counted/summed/averaged.\n"
+            "Use primary key values that do NOT conflict with existing data.\n"
+            'In the response, set "target_columns" to ["all"].\n\n'
+        ) + INSERT_EXAMPLES
     else:
         action = (
             f"MODIFY approximately {num_targets} underlying row(s) — change column "
@@ -323,6 +430,75 @@ Respond with JSON only:
 """
 
 
+def build_insert_retry_prompt(
+    *,
+    previous_altering_sql: str,
+    previous_explanation: str,
+    error_message: str,
+    gold_sql: str,
+    db_ddl: str,
+    gold_result: list[dict[str, Any]],
+    altered_result: list[dict[str, Any]],
+    num_inserts: int = 1,
+    has_limit: bool = False,
+) -> str:
+    """Build a retry prompt when a previous INSERT alteration failed validation."""
+    _, action = _format_targeted(
+        [], AlterationType.INSERT, num_inserts=num_inserts,
+    )
+
+    limit_note = ""
+    if has_limit:
+        limit_note = (
+            "\n**IMPORTANT — LIMIT query:** This query uses a LIMIT clause. Your inserted "
+            "rows MUST be ranked high enough to appear within the LIMIT and push at least "
+            "one existing row out of the result. Choose values that sort ahead of existing rows.\n"
+        )
+
+    return f"""\
+Your previous INSERT SQL did NOT produce the correct result. Please fix it.
+
+## Database Schema (DDL)
+```sql
+{db_ddl}
+```
+
+## Gold SQL Query
+```sql
+{gold_sql}
+```
+
+## Original Query Result ({len(gold_result)} rows)
+{_format_rows(gold_result)}
+{limit_note}
+## Required Action
+{action}
+
+## Your Previous Attempt
+```sql
+{previous_altering_sql}
+```
+Previous explanation: {previous_explanation}
+
+## Validation Error
+{error_message}
+
+## Result After Your Previous Alteration ({len(altered_result)} rows)
+{_format_rows(altered_result)}
+
+Please provide a CORRECTED INSERT SQL. Ensure the inserted rows satisfy the \
+query's filtering conditions (WHERE, JOIN, HAVING) so they appear in the result. \
+Use realistic-looking data and non-conflicting primary keys.
+
+Respond with JSON only:
+{{
+  "altering_sql": "<corrected INSERT SQL>",
+  "target_columns": ["all"],
+  "explanation": "<why this corrected insertion works>"
+}}\
+"""
+
+
 def build_aggregate_retry_prompt(
     *,
     previous_altering_sql: str,
@@ -342,6 +518,15 @@ def build_aggregate_retry_prompt(
             f"table(s) so that the aggregate result changes.\n"
             'In the response, set "target_columns" to ["all"].'
         )
+    elif alteration_type == AlterationType.INSERT:
+        action = (
+            f"INSERT approximately {num_targets} new row(s) into the relevant table(s) "
+            "so that the aggregate result changes (e.g., COUNT increases, SUM/AVG shifts).\n"
+            "The inserted data must look realistic and normal — like legitimate records. "
+            "The rows must satisfy the query's conditions so they are counted/summed/averaged.\n"
+            "Use primary key values that do NOT conflict with existing data.\n"
+            'In the response, set "target_columns" to ["all"].\n\n'
+        ) + INSERT_EXAMPLES
     else:
         action = (
             f"MODIFY approximately {num_targets} underlying row(s) — change column "
@@ -408,8 +593,8 @@ you will generate one thing.
 
 1. follow_up_question
    A natural question the user would ask when they notice the wrong output \
-instead of the expected one (e.g. "Why is X missing?" or "Why does the count \
-show Y instead of Z?").
+instead of the expected one (e.g. "Why is X missing?", "Why does the count \
+show Y instead of Z?", or "Why are there unexpected new records with strange values?").
 
 OUTPUT FORMAT — respond with valid JSON only:
 {

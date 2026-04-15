@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 class AlterationType(str, Enum):
     DELETE = "delete"   # Remove entire row(s)
     MODIFY = "modify"   # Change specific column values so the row no longer matches
+    INSERT = "insert"   # Add new corrupted row(s) that appear in the query result
 
 
 # ── Input Models (BIRD dataset) ───────────────────────────────────────────────
@@ -68,12 +69,13 @@ class AlterationDecision(BaseModel):
 class LLMAlterationResponse(BaseModel):
     """Structured output from the LLM for Step 1: generating the altering SQL."""
     altering_sql: str = Field(
-        description="SQL statement(s) to alter the database (DELETE or UPDATE)"
+        description="SQL statement(s) to alter the database (DELETE, UPDATE, or INSERT)"
     )
     target_columns: list[str] = Field(
         description=(
             "Which column(s) were modified. For DELETE: ['all']. "
-            "For MODIFY: the specific column name(s) that were changed."
+            "For MODIFY: the specific column name(s) that were changed. "
+            "For INSERT: ['all']."
         )
     )
     explanation: str = Field(
@@ -105,6 +107,14 @@ class ValidationResult(BaseModel):
     unintended_missing: list[dict[str, Any]] = Field(
         default_factory=list,
         description="Non-targeted records that were unintentionally removed",
+    )
+    new_records: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="New records that appeared in the altered result (used for INSERT)",
+    )
+    displaced_records: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Original records displaced by inserted rows (LIMIT queries)",
     )
 
 
