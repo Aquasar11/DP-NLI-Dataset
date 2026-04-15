@@ -175,6 +175,7 @@ class Pipeline:
         db_manager: DatabaseManager | None = None,
         llm_client: LLMClient | None = None,
         dataset: str = "bird_train",
+        train_json_path: Path | None = None,
         sample_count: int | None = None,
         delete_probability: float | None = None,
         insert_probability: float | None = None,
@@ -185,6 +186,7 @@ class Pipeline:
         max_workers: int | None = None,
     ) -> None:
         self.dataset = dataset
+        self.train_json_path = train_json_path
         if db_manager is not None:
             self.db = db_manager
         else:
@@ -233,7 +235,7 @@ class Pipeline:
         dataset-derived default.
         """
         if path is None:
-            path = _dataset_json_path(self.dataset)
+            path = self.train_json_path or _dataset_json_path(self.dataset)
         logger.info("Loading samples from %s (dataset=%s)", path, self.dataset)
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)

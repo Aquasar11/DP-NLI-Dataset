@@ -249,6 +249,7 @@ def main() -> None:
         db_manager=db_manager,
         llm_client=llm_client,
         dataset=dataset,
+        train_json_path=Path(train_json),
         sample_count=args.samples,
         delete_probability=args.delete_prob,
         insert_probability=args.insert_prob,
