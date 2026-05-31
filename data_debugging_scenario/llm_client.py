@@ -19,6 +19,7 @@ from google import genai
 from google.genai.types import GenerateContentConfig
 from google.oauth2 import service_account
 from openai import OpenAI, APIError, RateLimitError, APITimeoutError
+from retry import retry
 
 import config
 from models import LLMAlterationResponse, LLMFollowUpResponse
@@ -48,6 +49,10 @@ logger = logging.getLogger(__name__)
 # Retry config for API-level errors (rate limits, timeouts)
 API_MAX_RETRIES = 5
 API_RETRY_BASE_DELAY = 2.0  # seconds
+
+
+class RetryableLLMError(RuntimeError):
+    """Raised to trigger retry-package backoff for transient LLM errors."""
 
 
 def _parse_json(raw: str) -> dict[str, Any]:
@@ -99,7 +104,15 @@ class LLMClient:
         Returns the raw content string from the LLM response.
         """
         _t0 = time.perf_counter()
-        for attempt in range(1, API_MAX_RETRIES + 1):
+
+        @retry(
+            RetryableLLMError,
+            tries=API_MAX_RETRIES,
+            delay=API_RETRY_BASE_DELAY,
+            backoff=2,
+            logger=logger,
+        )
+        def _call_with_retry() -> str:
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -113,27 +126,11 @@ class LLMClient:
                 content = response.choices[0].message.content
                 if content is None:
                     raise ValueError("LLM returned empty content")
-                return content.strip(), time.perf_counter() - _t0
+                return content.strip()
+            except Exception as e:
+                raise RetryableLLMError(str(e)) from e
 
-            except (RateLimitError, APITimeoutError) as e:
-                delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(
-                    "API error (attempt %d/%d): %s — retrying in %.1fs",
-                    attempt, API_MAX_RETRIES, e, delay,
-                )
-                time.sleep(delay)
-            except APIError as e:
-                if e.status_code and e.status_code >= 500:
-                    delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    logger.warning(
-                        "Server error (attempt %d/%d): %s — retrying in %.1fs",
-                        attempt, API_MAX_RETRIES, e, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    raise
-
-        raise RuntimeError(f"API call failed after {API_MAX_RETRIES} attempts")  # pragma: no cover
+        return _call_with_retry(), time.perf_counter() - _t0
 
     @staticmethod
     def _parse_json(raw: str) -> dict[str, Any]:
@@ -264,7 +261,15 @@ class GeminiClient:
         Returns the raw content string and the elapsed time in seconds.
         """
         _t0 = time.perf_counter()
-        for attempt in range(1, API_MAX_RETRIES + 1):
+
+        @retry(
+            RetryableLLMError,
+            tries=API_MAX_RETRIES,
+            delay=API_RETRY_BASE_DELAY,
+            backoff=2,
+            logger=logger,
+        )
+        def _call_with_retry() -> str:
             try:
                 response = self.client.models.generate_content(
                     model=self.model,
@@ -278,33 +283,11 @@ class GeminiClient:
                 content = response.text
                 if content is None:
                     raise ValueError("Gemini returned empty content")
-                return content.strip(), time.perf_counter() - _t0
-
+                return content.strip()
             except Exception as e:
-                # Determine whether the error is retryable by inspecting the
-                # status code (if present on the exception) or common keywords.
-                status_code: int | None = getattr(e, "status_code", None) or getattr(
-                    getattr(e, "response", None), "status_code", None
-                )
-                retryable = (
-                    status_code in _GEMINI_RETRYABLE_STATUS_CODES
-                    if status_code is not None
-                    else any(
-                        kw in str(e).lower()
-                        for kw in ("rate", "quota", "timeout", "unavailable", "500", "503")
-                    )
-                )
-                if retryable and attempt < API_MAX_RETRIES:
-                    delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    logger.warning(
-                        "Gemini API error (attempt %d/%d): %s — retrying in %.1fs",
-                        attempt, API_MAX_RETRIES, e, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    raise
+                raise RetryableLLMError(str(e)) from e
 
-        raise RuntimeError(f"Gemini API call failed after {API_MAX_RETRIES} attempts")  # pragma: no cover
+        return _call_with_retry(), time.perf_counter() - _t0
 
     # Re-use the module-level JSON parser.
     _parse_json = staticmethod(_parse_json)
@@ -411,7 +394,14 @@ class ClaudeVertexClient:
         )
         messages = [{"role": "user", "content": full_user_prompt}]
 
-        for attempt in range(1, API_MAX_RETRIES + 1):
+        @retry(
+            RetryableLLMError,
+            tries=API_MAX_RETRIES,
+            delay=API_RETRY_BASE_DELAY,
+            backoff=2,
+            logger=logger,
+        )
+        def _call_with_retry() -> str:
             try:
                 response = self.client.messages.create(
                     model=self.model,
@@ -423,28 +413,11 @@ class ClaudeVertexClient:
                 content = response.content[0].text if response.content else ""
                 if not content:
                     raise ValueError("Claude returned empty content")
-                return content.strip(), time.perf_counter() - _t0
+                return content.strip()
             except Exception as e:
-                status_code: int | None = getattr(e, "status_code", None)
-                retryable = (
-                    status_code in _CLAUDE_RETRYABLE_STATUS_CODES
-                    if status_code is not None
-                    else any(
-                        kw in str(e).lower()
-                        for kw in ("rate", "quota", "timeout", "unavailable", "overloaded")
-                    )
-                )
-                if retryable and attempt < API_MAX_RETRIES:
-                    delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    logger.warning(
-                        "Claude API error (attempt %d/%d): %s — retrying in %.1fs",
-                        attempt, API_MAX_RETRIES, e, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    raise
+                raise RetryableLLMError(str(e)) from e
 
-        raise RuntimeError(f"Claude API call failed after {API_MAX_RETRIES} attempts")
+        return _call_with_retry(), time.perf_counter() - _t0
 
     _parse_json = staticmethod(_parse_json)
 

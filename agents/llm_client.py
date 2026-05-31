@@ -21,6 +21,7 @@ from google import genai
 from google.genai import types as genai_types
 from google.genai.types import GenerateContentConfig
 from openai import OpenAI, APIError, RateLimitError, APITimeoutError
+from retry import retry
 
 import config
 
@@ -40,6 +41,10 @@ class ChatResult:
 
 API_MAX_RETRIES = 5
 API_RETRY_BASE_DELAY = 2.0  # seconds
+
+
+class RetryableLLMError(RuntimeError):
+    """Raised to trigger retry-package backoff for transient LLM errors."""
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -117,7 +122,14 @@ class LLMClient:
         )
         api_messages = [{"role": "system", "content": system_prompt}] + messages
 
-        for attempt in range(1, API_MAX_RETRIES + 1):
+        @retry(
+            RetryableLLMError,
+            tries=API_MAX_RETRIES,
+            delay=API_RETRY_BASE_DELAY,
+            backoff=2,
+            logger=logger,
+        )
+        def _call_with_retry() -> str:
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
@@ -128,42 +140,24 @@ class LLMClient:
                 content = response.choices[0].message.content
                 if not content:
                     raise ValueError("LLM returned empty content")
-                return ChatResult(
-                    content=content.strip(),
-                    duration_seconds=round(time.perf_counter() - _t0, 3),
-                    success=True,
-                )
+                return content.strip()
+            except Exception as exc:
+                raise RetryableLLMError(str(exc)) from exc
 
-            except (RateLimitError, APITimeoutError) as exc:
-                delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                logger.warning(
-                    "API transient error (attempt %d/%d): %s — retrying in %.1fs",
-                    attempt, API_MAX_RETRIES, exc, delay,
-                )
-                time.sleep(delay)
-
-            except APIError as exc:
-                if exc.status_code and exc.status_code >= 500:
-                    delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    logger.warning(
-                        "Server error %d (attempt %d/%d): %s — retrying in %.1fs",
-                        exc.status_code, attempt, API_MAX_RETRIES, exc, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    return ChatResult(
-                        content="",
-                        duration_seconds=round(time.perf_counter() - _t0, 3),
-                        success=False,
-                        error=str(exc),
-                    )
-
-        return ChatResult(
-            content="",
-            duration_seconds=round(time.perf_counter() - _t0, 3),
-            success=False,
-            error=f"API call failed after {API_MAX_RETRIES} attempts",
-        )
+        try:
+            content = _call_with_retry()
+            return ChatResult(
+                content=content,
+                duration_seconds=round(time.perf_counter() - _t0, 3),
+                success=True,
+            )
+        except Exception as exc:
+            return ChatResult(
+                content="",
+                duration_seconds=round(time.perf_counter() - _t0, 3),
+                success=False,
+                error=str(exc),
+            )
 
     def chat_json(
         self,
@@ -300,7 +294,14 @@ class GeminiClient:
                 )
             ]
 
-        for attempt in range(1, API_MAX_RETRIES + 1):
+        @retry(
+            RetryableLLMError,
+            tries=API_MAX_RETRIES,
+            delay=API_RETRY_BASE_DELAY,
+            backoff=2,
+            logger=logger,
+        )
+        def _call_with_retry() -> str:
             try:
                 response = self.client.models.generate_content(
                     model=self.model,
@@ -314,45 +315,24 @@ class GeminiClient:
                 content = response.text
                 if not content:
                     raise ValueError("Gemini returned empty content")
-                return ChatResult(
-                    content=content.strip(),
-                    duration_seconds=round(time.perf_counter() - _t0, 3),
-                    success=True,
-                )
-
+                return content.strip()
             except Exception as exc:
-                status_code: int | None = getattr(exc, "status_code", None) or getattr(
-                    getattr(exc, "response", None), "status_code", None
-                )
-                retryable = (
-                    status_code in _GEMINI_RETRYABLE_STATUS_CODES
-                    if status_code is not None
-                    else any(
-                        kw in str(exc).lower()
-                        for kw in ("rate", "quota", "timeout", "unavailable", "500", "503")
-                    )
-                )
-                if retryable and attempt < API_MAX_RETRIES:
-                    delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    logger.warning(
-                        "Gemini transient error (attempt %d/%d): %s — retrying in %.1fs",
-                        attempt, API_MAX_RETRIES, exc, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    return ChatResult(
-                        content="",
-                        duration_seconds=round(time.perf_counter() - _t0, 3),
-                        success=False,
-                        error=str(exc),
-                    )
+                raise RetryableLLMError(str(exc)) from exc
 
-        return ChatResult(
-            content="",
-            duration_seconds=round(time.perf_counter() - _t0, 3),
-            success=False,
-            error=f"Gemini API call failed after {API_MAX_RETRIES} attempts",
-        )
+        try:
+            content = _call_with_retry()
+            return ChatResult(
+                content=content,
+                duration_seconds=round(time.perf_counter() - _t0, 3),
+                success=True,
+            )
+        except Exception as exc:
+            return ChatResult(
+                content="",
+                duration_seconds=round(time.perf_counter() - _t0, 3),
+                success=False,
+                error=str(exc),
+            )
 
     def chat_json(
         self,
@@ -462,7 +442,14 @@ class ClaudeVertexClient:
             else:
                 api_messages.append({"role": "user", "content": json_instruction})
 
-        for attempt in range(1, API_MAX_RETRIES + 1):
+        @retry(
+            RetryableLLMError,
+            tries=API_MAX_RETRIES,
+            delay=API_RETRY_BASE_DELAY,
+            backoff=2,
+            logger=logger,
+        )
+        def _call_with_retry() -> str:
             try:
                 response = self.client.messages.create(
                     model=self.model,
@@ -474,43 +461,24 @@ class ClaudeVertexClient:
                 content = response.content[0].text if response.content else ""
                 if not content:
                     raise ValueError("Claude returned empty content")
-                return ChatResult(
-                    content=content.strip(),
-                    duration_seconds=round(time.perf_counter() - _t0, 3),
-                    success=True,
-                )
-
+                return content.strip()
             except Exception as exc:
-                status_code: int | None = getattr(exc, "status_code", None)
-                retryable = (
-                    status_code in _CLAUDE_RETRYABLE_STATUS_CODES
-                    if status_code is not None
-                    else any(
-                        kw in str(exc).lower()
-                        for kw in ("rate", "quota", "timeout", "unavailable", "overloaded")
-                    )
-                )
-                if retryable and attempt < API_MAX_RETRIES:
-                    delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    logger.warning(
-                        "Claude transient error (attempt %d/%d): %s — retrying in %.1fs",
-                        attempt, API_MAX_RETRIES, exc, delay,
-                    )
-                    time.sleep(delay)
-                else:
-                    return ChatResult(
-                        content="",
-                        duration_seconds=round(time.perf_counter() - _t0, 3),
-                        success=False,
-                        error=str(exc),
-                    )
+                raise RetryableLLMError(str(exc)) from exc
 
-        return ChatResult(
-            content="",
-            duration_seconds=round(time.perf_counter() - _t0, 3),
-            success=False,
-            error=f"Claude API call failed after {API_MAX_RETRIES} attempts",
-        )
+        try:
+            content = _call_with_retry()
+            return ChatResult(
+                content=content,
+                duration_seconds=round(time.perf_counter() - _t0, 3),
+                success=True,
+            )
+        except Exception as exc:
+            return ChatResult(
+                content="",
+                duration_seconds=round(time.perf_counter() - _t0, 3),
+                success=False,
+                error=str(exc),
+            )
 
     def chat_json(
         self,
