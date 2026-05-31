@@ -1,10 +1,11 @@
 """
-LLM client wrappers for OpenAI and Google Gen AI (Gemini) API calls.
+LLM client wrappers for OpenAI, Google Gen AI (Gemini), and Anthropic Claude
+(via Vertex AI) API calls.
 
 Provides a general-purpose multi-turn chat interface with automatic retry
 logic for transient API errors, supporting both plain-text and JSON-structured
-responses from either the OpenAI-compatible API or Google Vertex AI / Gemini
-Developer API.
+responses from either the OpenAI-compatible API, Google Vertex AI / Gemini
+Developer API, or Anthropic Vertex AI.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from anthropic import AnthropicVertex
 from google import genai
 from google.genai import types as genai_types
 from google.genai.types import GenerateContentConfig
@@ -382,3 +384,162 @@ class GeminiClient:
                 ),
                 None,
             )
+
+
+# ── Anthropic Claude on Vertex AI ────────────────────────────────────────────
+
+_CLAUDE_RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+
+
+class ClaudeVertexClient:
+    """
+    Wrapper around the Anthropic Vertex AI SDK for chat interactions.
+
+    Supports multi-turn conversations with a system prompt and automatic
+    retry logic for transient errors. JSON responses are requested via a
+    prefill trick since Claude on Vertex does not support a native JSON mode.
+    """
+
+    def __init__(
+        self,
+        model: str | None = None,
+        temperature: float | None = None,
+        project_id: str | None = None,
+        region: str | None = None,
+    ) -> None:
+        self.model = model or config.CLAUDE_MODEL
+        self.temperature = (
+            temperature if temperature is not None else config.CLAUDE_TEMPERATURE
+        )
+        _project = project_id or config.GCP_PROJECT or config.GOOGLE_CLOUD_PROJECT
+        _region = region or config.GCP_REGION or config.GOOGLE_CLOUD_LOCATION or "global"
+
+        # The SDK constructs the base URL as f"https://{region}-aiplatform.googleapis.com/v1",
+        # which produces an invalid host for the special "global" endpoint.
+        # The correct global base URL omits the region prefix entirely.
+        _base_url = (
+            "https://aiplatform.googleapis.com/v1"
+            if _region == "global"
+            else None  # let the SDK derive it from the region
+        )
+
+        self.client = AnthropicVertex(region=_region, project_id=_project, base_url=_base_url)
+        logger.info(
+            "Claude Vertex client initialized: model=%s, project=%s, region=%s",
+            self.model, _project, _region,
+        )
+
+    def chat(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+        response_format: str = "text",
+    ) -> ChatResult:
+        """
+        Send a multi-turn conversation and return the model's response.
+
+        Args:
+            system_prompt: Global instruction context.
+            messages: Ordered turns as ``[{"role": "user"|"assistant", "content": "..."}]``.
+            response_format: ``"text"`` for plain text or ``"json"`` for a JSON object.
+
+        Returns:
+            :class:`ChatResult` — successful or not.
+        """
+        _t0 = time.perf_counter()
+
+        # Vertex Claude does not support assistant prefill — the conversation
+        # must end with a user message. For JSON mode we append an instruction
+        # to the last user message instead of using a prefill.
+        api_messages = [{"role": m["role"], "content": m["content"]} for m in messages]
+        if response_format == "json":
+            json_instruction = "\n\nRespond with a valid JSON object only. Do not include any text outside the JSON."
+            if api_messages and api_messages[-1]["role"] == "user":
+                api_messages[-1] = {
+                    "role": "user",
+                    "content": api_messages[-1]["content"] + json_instruction,
+                }
+            else:
+                api_messages.append({"role": "user", "content": json_instruction})
+
+        for attempt in range(1, API_MAX_RETRIES + 1):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=system_prompt,
+                    messages=api_messages,
+                    temperature=self.temperature,
+                )
+                content = response.content[0].text if response.content else ""
+                if not content:
+                    raise ValueError("Claude returned empty content")
+                return ChatResult(
+                    content=content.strip(),
+                    duration_seconds=round(time.perf_counter() - _t0, 3),
+                    success=True,
+                )
+
+            except Exception as exc:
+                status_code: int | None = getattr(exc, "status_code", None)
+                retryable = (
+                    status_code in _CLAUDE_RETRYABLE_STATUS_CODES
+                    if status_code is not None
+                    else any(
+                        kw in str(exc).lower()
+                        for kw in ("rate", "quota", "timeout", "unavailable", "overloaded")
+                    )
+                )
+                if retryable and attempt < API_MAX_RETRIES:
+                    delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Claude transient error (attempt %d/%d): %s — retrying in %.1fs",
+                        attempt, API_MAX_RETRIES, exc, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    return ChatResult(
+                        content="",
+                        duration_seconds=round(time.perf_counter() - _t0, 3),
+                        success=False,
+                        error=str(exc),
+                    )
+
+        return ChatResult(
+            content="",
+            duration_seconds=round(time.perf_counter() - _t0, 3),
+            success=False,
+            error=f"Claude API call failed after {API_MAX_RETRIES} attempts",
+        )
+
+    def chat_json(
+        self,
+        system_prompt: str,
+        messages: list[dict[str, str]],
+    ) -> tuple[ChatResult, dict[str, Any] | None]:
+        """
+        Convenience wrapper: call :meth:`chat` with ``response_format="json"``
+        and parse the returned JSON.
+
+        Returns:
+            ``(ChatResult, parsed_dict)`` — ``parsed_dict`` is ``None`` on error.
+        """
+        result = self.chat(system_prompt, messages, response_format="json")
+        if not result.success:
+            return result, None
+        try:
+            return result, parse_json_response(result.content)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning(
+                "JSON parse error: %s — raw snippet: %.200s", exc, result.content
+            )
+            return (
+                ChatResult(
+                    content=result.content,
+                    duration_seconds=result.duration_seconds,
+                    success=False,
+                    error=f"JSON parse error: {exc}",
+                ),
+                None,
+            )
+

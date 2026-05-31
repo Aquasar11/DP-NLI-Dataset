@@ -1,5 +1,6 @@
 """
-LLM client wrappers for OpenAI and Google Gen AI (Gemini) API calls.
+LLM client wrappers for OpenAI, Google Gen AI (Gemini), and Anthropic Claude
+(via Vertex AI) API calls.
 
 Handles structured JSON output parsing, retries for API errors,
 and configurable model selection.
@@ -13,6 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
 
+from anthropic import AnthropicVertex
 from google import genai
 from google.genai.types import GenerateContentConfig
 from google.oauth2 import service_account
@@ -305,6 +307,145 @@ class GeminiClient:
         raise RuntimeError(f"Gemini API call failed after {API_MAX_RETRIES} attempts")  # pragma: no cover
 
     # Re-use the module-level JSON parser.
+    _parse_json = staticmethod(_parse_json)
+
+    def generate_alteration(self, user_prompt: str) -> LLMCallResult[LLMAlterationResponse]:
+        """Step 1: Generate altering SQL and explanation."""
+        try:
+            raw, duration = self._call_api(ALTERATION_SYSTEM_PROMPT, user_prompt)
+            data = self._parse_json(raw)
+            parsed = LLMAlterationResponse(**data)
+            return LLMCallResult(
+                parsed=parsed,
+                system_prompt=ALTERATION_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                raw_response=raw,
+                parsed_dict=data,
+                duration_seconds=round(duration, 3),
+                success=True,
+            )
+        except Exception as e:
+            return LLMCallResult(
+                parsed=None,
+                system_prompt=ALTERATION_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                raw_response=None,
+                parsed_dict=None,
+                duration_seconds=0.0,
+                success=False,
+                error=str(e),
+            )
+
+    def generate_followup(self, user_prompt: str) -> LLMCallResult[LLMFollowUpResponse]:
+        """Step 2: Generate follow-up question, explanation, and fix."""
+        try:
+            raw, duration = self._call_api(FOLLOWUP_SYSTEM_PROMPT, user_prompt)
+            data = self._parse_json(raw)
+            parsed = LLMFollowUpResponse(**data)
+            return LLMCallResult(
+                parsed=parsed,
+                system_prompt=FOLLOWUP_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                raw_response=raw,
+                parsed_dict=data,
+                duration_seconds=round(duration, 3),
+                success=True,
+            )
+        except Exception as e:
+            return LLMCallResult(
+                parsed=None,
+                system_prompt=FOLLOWUP_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                raw_response=None,
+                parsed_dict=None,
+                duration_seconds=0.0,
+                success=False,
+                error=str(e),
+            )
+
+
+# ── Anthropic Claude on Vertex AI ────────────────────────────────────────────
+
+_CLAUDE_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+class ClaudeVertexClient:
+    """
+    Wrapper around the Anthropic Vertex AI SDK for structured LLM interactions.
+
+    JSON responses are elicited via an instruction appended to the user prompt
+    (Vertex Claude does not support assistant prefill or a native JSON mode).
+    """
+
+    def __init__(
+        self,
+        model: str | None = None,
+        temperature: float | None = None,
+        project_id: str | None = None,
+        region: str | None = None,
+    ):
+        self.model = model or config.CLAUDE_MODEL
+        self.temperature = temperature if temperature is not None else config.CLAUDE_TEMPERATURE
+        _project = project_id or config.GCP_PROJECT or config.GOOGLE_CLOUD_PROJECT
+        _region = region or config.GCP_REGION or config.GOOGLE_CLOUD_LOCATION or "global"
+        # The SDK builds the base URL as f"https://{region}-aiplatform.googleapis.com/v1".
+        # For the special "global" endpoint the correct URL has no region prefix.
+        _base_url = (
+            "https://aiplatform.googleapis.com/v1"
+            if _region == "global"
+            else None
+        )
+        self.client = AnthropicVertex(region=_region, project_id=_project, base_url=_base_url)
+        logger.info(
+            "Claude Vertex client initialized: model=%s, project=%s, region=%s",
+            self.model, _project, _region,
+        )
+
+    def _call_api(self, system_prompt: str, user_prompt: str) -> tuple[str, float]:
+        """Make a Claude Vertex API call with retry logic for transient errors."""
+        _t0 = time.perf_counter()
+        # Append explicit JSON instruction — Vertex Claude does not support prefill.
+        full_user_prompt = (
+            user_prompt + "\n\nRespond with a valid JSON object only. "
+            "Do not include any text outside the JSON."
+        )
+        messages = [{"role": "user", "content": full_user_prompt}]
+
+        for attempt in range(1, API_MAX_RETRIES + 1):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=4096,
+                    system=system_prompt,
+                    messages=messages,
+                    temperature=self.temperature,
+                )
+                content = response.content[0].text if response.content else ""
+                if not content:
+                    raise ValueError("Claude returned empty content")
+                return content.strip(), time.perf_counter() - _t0
+            except Exception as e:
+                status_code: int | None = getattr(e, "status_code", None)
+                retryable = (
+                    status_code in _CLAUDE_RETRYABLE_STATUS_CODES
+                    if status_code is not None
+                    else any(
+                        kw in str(e).lower()
+                        for kw in ("rate", "quota", "timeout", "unavailable", "overloaded")
+                    )
+                )
+                if retryable and attempt < API_MAX_RETRIES:
+                    delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Claude API error (attempt %d/%d): %s — retrying in %.1fs",
+                        attempt, API_MAX_RETRIES, e, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
+
+        raise RuntimeError(f"Claude API call failed after {API_MAX_RETRIES} attempts")
+
     _parse_json = staticmethod(_parse_json)
 
     def generate_alteration(self, user_prompt: str) -> LLMCallResult[LLMAlterationResponse]:

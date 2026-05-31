@@ -41,6 +41,10 @@ GEMINI_USE_VERTEXAI: bool = (
 GOOGLE_CLOUD_PROJECT: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 GOOGLE_CLOUD_LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
 
+# ── Anthropic Claude on Vertex AI ─────────────────────────────────────────
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_TEMPERATURE: float = float(os.getenv("CLAUDE_TEMPERATURE", "0.3"))
+
 # ── Agent settings ──────────────────────────────────────────────────────────
 # Maximum Q&A turns the ExplanationAgent may use
 MAX_EXPLANATION_TURNS: int = int(os.getenv("MAX_EXPLANATION_TURNS", "6"))

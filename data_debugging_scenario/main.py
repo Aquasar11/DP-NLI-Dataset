@@ -25,7 +25,7 @@ from pathlib import Path
 
 import config
 from db_manager import DatabaseManager
-from llm_client import GeminiClient, LLMClient
+from llm_client import ClaudeVertexClient, GeminiClient, LLMClient
 from pipeline import Pipeline
 
 
@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         "--provider",
         type=str,
         default="openai",
-        choices=["openai", "gemini"],
+        choices=["openai", "gemini", "claude"],
         help="LLM provider to use",
     )
     parser.add_argument(
@@ -227,6 +227,11 @@ def main() -> None:
             model=args.model,
             temperature=args.temperature,
             use_vertexai=args.use_vertexai or None,
+        )
+    elif args.provider == "claude":
+        llm_client = ClaudeVertexClient(
+            model=args.model,
+            temperature=args.temperature,
         )
     else:
         llm_client = LLMClient(

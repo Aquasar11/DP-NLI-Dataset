@@ -45,6 +45,7 @@ class AttemptLog:
     attempt: int
     llm_call: LLMCallLog
     altering_sql: str
+    alter_rows_affected: int | None
     sandbox_execute_success: bool
     sandbox_execute_error: str | None
     gold_sql_on_sandbox_success: bool
@@ -150,6 +151,7 @@ def make_attempt_log(
     attempt: int,
     llm_call: LLMCallLog,
     altering_sql: str,
+    alter_rows_affected: int | None,
     sandbox_execute_success: bool,
     sandbox_execute_error: str | None,
     gold_sql_on_sandbox_success: bool,
@@ -164,6 +166,7 @@ def make_attempt_log(
         attempt=attempt,
         llm_call=llm_call,
         altering_sql=altering_sql,
+        alter_rows_affected=alter_rows_affected,
         sandbox_execute_success=sandbox_execute_success,
         sandbox_execute_error=sandbox_execute_error,
         gold_sql_on_sandbox_success=gold_sql_on_sandbox_success,

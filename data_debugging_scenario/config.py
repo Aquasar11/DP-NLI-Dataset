@@ -57,7 +57,7 @@ GCP_CREDENTIALS: str = os.getenv("GCP_CREDENTIALS", "")
 
 # ── Gemini (Google Gen AI SDK) ─────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
 GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.3"))
 # Set GOOGLE_GENAI_USE_VERTEXAI=True to route through Vertex AI instead of the
 # Gemini Developer API. When using Vertex AI, GOOGLE_CLOUD_PROJECT and
@@ -65,6 +65,10 @@ GEMINI_TEMPERATURE: float = float(os.getenv("GEMINI_TEMPERATURE", "0.3"))
 GEMINI_USE_VERTEXAI: bool = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "False").lower() == "true"
 GOOGLE_CLOUD_PROJECT: str = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 GOOGLE_CLOUD_LOCATION: str = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+
+# ── Anthropic Claude on Vertex AI ───────────────────────────────────────────
+CLAUDE_MODEL: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
+CLAUDE_TEMPERATURE: float = float(os.getenv("CLAUDE_TEMPERATURE", "0.3"))
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
 SAMPLE_COUNT: int = 10          # 0 = process all samples

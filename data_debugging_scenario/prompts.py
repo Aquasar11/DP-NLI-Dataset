@@ -308,6 +308,7 @@ def build_aggregate_alteration_prompt(
     gold_result: list[dict[str, Any]],
     alteration_type: AlterationType,
     num_targets: int,
+    candidate_rows_context: str = "",
 ) -> str:
     """Build the user prompt for Step 1 when the gold query is an aggregate."""
     if alteration_type == AlterationType.DELETE:
@@ -353,12 +354,16 @@ def build_aggregate_alteration_prompt(
 ## Current Aggregate Result
 {_format_rows(gold_result)}
 
+## Real Candidate Rows (from current DB)
+{candidate_rows_context or "(unavailable)"}
+
 ## Required Action
 {action}
 
 Write the SQL statement(s) that will alter the database so that when the gold \
 SQL query is re-executed, it returns a DIFFERENT aggregate value than the one \
-shown above.
+shown above. Use the real keys shown in "Real Candidate Rows" when writing \
+WHERE clauses; do not invent IDs.
 
 Respond with JSON only.\
 """
@@ -510,6 +515,7 @@ def build_aggregate_retry_prompt(
     altered_result: list[dict[str, Any]],
     alteration_type: AlterationType,
     num_targets: int,
+    candidate_rows_context: str = "",
 ) -> str:
     """Build a retry prompt when a previous aggregate alteration failed validation."""
     if alteration_type == AlterationType.DELETE:
@@ -555,6 +561,9 @@ Your previous alteration SQL did NOT change the aggregate result. Please fix it.
 ## Original Aggregate Result
 {_format_rows(gold_result)}
 
+## Real Candidate Rows (from current DB)
+{candidate_rows_context or "(unavailable)"}
+
 ## Required Action
 {action}
 
@@ -571,7 +580,9 @@ Previous explanation: {previous_explanation}
 {_format_rows(altered_result)}
 
 Please provide a CORRECTED altering SQL that causes the aggregate query to \
-return a DIFFERENT value than the original.
+return a DIFFERENT value than the original. If your previous attempt changed \
+0 rows, your WHERE clause likely matched nothing. Use real keys from the \
+candidate rows or use a subquery that selects real rows.
 
 Respond with JSON only:
 {{

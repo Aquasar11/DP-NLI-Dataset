@@ -87,10 +87,10 @@ class DatabaseManager:
         finally:
             conn.close()
 
-    def execute_alter(self, db_path: Path, alter_sql: str) -> None:
+    def execute_alter(self, db_path: Path, alter_sql: str) -> int:
         """
         Execute one or more data-altering SQL statements (DELETE, UPDATE, INSERT)
-        on the given database.
+        on the given database and return how many rows were changed.
 
         The alter_sql may contain multiple statements separated by semicolons.
 
@@ -98,13 +98,18 @@ class DatabaseManager:
             db_path: Path to the SQLite database file (typically a sandbox copy).
             alter_sql: SQL statement(s) to execute.
 
+        Returns:
+            Number of rows changed by the script.
+
         Raises:
             sqlite3.Error: If any statement fails (transaction is rolled back).
         """
         conn = sqlite3.connect(str(db_path), timeout=30)
         try:
+            before = conn.total_changes
             conn.executescript(alter_sql)
             conn.commit()
+            return conn.total_changes - before
         except Exception:
             conn.rollback()
             raise

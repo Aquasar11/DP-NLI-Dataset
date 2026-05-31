@@ -18,6 +18,7 @@ import datetime
 import json
 import logging
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -250,6 +251,88 @@ class Pipeline:
 
         logger.info("Loaded %d samples total", len(samples))
         return samples
+
+    # ── Aggregate prompt grounding helpers ───────────────────────────────
+
+    @staticmethod
+    def _extract_sql_tables(sql: str) -> list[str]:
+        """Extract table names from FROM/JOIN clauses using a lightweight regex."""
+        pattern = re.compile(r"\b(?:FROM|JOIN)\s+([`\"]?[\w]+[`\"]?)", re.IGNORECASE)
+        tables: list[str] = []
+        for match in pattern.findall(sql):
+            table = match.strip("`\"")
+            if table and table not in tables:
+                tables.append(table)
+        return tables
+
+    def _build_aggregate_candidate_rows_context(
+        self,
+        db_path: Path,
+        gold_sql: str,
+        max_tables: int = 3,
+        max_rows_per_table: int = 8,
+    ) -> str:
+        """
+        Build prompt context containing real row keys/values for aggregate prompts.
+
+        This reduces hallucinated IDs by exposing concrete primary-key values and
+        condition-related columns from underlying tables.
+        """
+        sql_tables = self._extract_sql_tables(gold_sql)
+        if not sql_tables:
+            return "(no FROM/JOIN tables detected)"
+
+        sql_upper = gold_sql.upper()
+        blocks: list[str] = []
+
+        for table in sql_tables[:max_tables]:
+            try:
+                col_info = self.db.get_column_info(db_path, table)
+            except Exception:
+                continue
+
+            if not col_info:
+                continue
+
+            pk_cols = [c["name"] for c in col_info if int(c.get("pk", 0)) > 0]
+            all_cols = [c["name"] for c in col_info]
+            condition_cols = [
+                c for c in all_cols
+                if re.search(rf"\b{re.escape(c)}\b", sql_upper, flags=re.IGNORECASE)
+            ]
+
+            selected_cols: list[str] = []
+            for col in pk_cols + condition_cols:
+                if col not in selected_cols:
+                    selected_cols.append(col)
+            if len(selected_cols) < 4:
+                for col in all_cols:
+                    if col not in selected_cols:
+                        selected_cols.append(col)
+                    if len(selected_cols) >= 4:
+                        break
+
+            select_exprs = [f'`{c}`' for c in selected_cols]
+            if not pk_cols:
+                select_exprs = ["rowid AS __rowid__"] + select_exprs
+
+            query = f"SELECT {', '.join(select_exprs)} FROM `{table}` LIMIT {max_rows_per_table}"
+            try:
+                rows = self.db.execute_query(db_path, query).rows
+            except Exception:
+                continue
+
+            if not rows:
+                continue
+
+            pk_desc = ", ".join(pk_cols) if pk_cols else "rowid (pseudo-key)"
+            row_lines = "\n".join(json.dumps(r, ensure_ascii=False, default=str) for r in rows)
+            blocks.append(
+                f"Table `{table}` (keys: {pk_desc})\n"
+                f"{row_lines}"
+            )
+
+        return "\n\n".join(blocks) if blocks else "(unable to sample candidate rows)"
 
     # ── Alteration Decision ────────────────────────────────────────────────
 
@@ -491,6 +574,17 @@ class Pipeline:
             logger.warning("[%d] Could not retrieve DDL: %s — using placeholder", sample_idx, e)
             db_ddl = "(DDL unavailable)"
 
+        aggregate_candidate_rows = ""
+        if is_aggregate:
+            aggregate_candidate_rows = self._build_aggregate_candidate_rows_context(
+                db_path=db_path,
+                gold_sql=sample.SQL,
+            )
+            logger.debug(
+                "[%d] Aggregate candidate-row context built (%d chars)",
+                sample_idx, len(aggregate_candidate_rows),
+            )
+
         # ── 7. Step 1 loop: generate + validate altering SQL ───────────────
         step1_attempts: list[AttemptLog] = []
         final_alteration_result = None
@@ -518,6 +612,7 @@ class Pipeline:
                         gold_result=gold_result,
                         alteration_type=decision.alteration_type,
                         num_targets=num_targets,
+                        candidate_rows_context=aggregate_candidate_rows,
                     )
                 elif _is_insert:
                     prompt = build_insert_alteration_prompt(
@@ -549,6 +644,7 @@ class Pipeline:
                         altered_result=prev_altered_result,
                         alteration_type=decision.alteration_type,
                         num_targets=num_targets,
+                        candidate_rows_context=aggregate_candidate_rows,
                     )
                 elif _is_insert:
                     prompt = build_insert_retry_prompt(
@@ -606,6 +702,7 @@ class Pipeline:
                 step1_attempts.append(make_attempt_log(
                     attempt=attempt, llm_call=llm_log,
                     altering_sql="",
+                    alter_rows_affected=None,
                     sandbox_execute_success=False,
                     sandbox_execute_error="LLM call failed",
                     gold_sql_on_sandbox_success=False,
@@ -644,6 +741,7 @@ class Pipeline:
             sandbox_path = self.db.create_sandbox(sample.db_id)
             sandbox_ok = False
             sandbox_err: str | None = None
+            alter_rows_affected: int | None = None
             gold_on_sandbox_ok = False
             gold_on_sandbox_err: str | None = None
             altered_result: list[dict[str, Any]] = []
@@ -651,9 +749,16 @@ class Pipeline:
 
             try:
                 try:
-                    self.db.execute_alter(sandbox_path, alteration_response.altering_sql)
+                    alter_rows_affected = self.db.execute_alter(
+                        sandbox_path,
+                        alteration_response.altering_sql,
+                    )
                     sandbox_ok = True
-                    logger.info("[%d] Altering SQL executed on sandbox ✓", sample_idx)
+                    logger.info(
+                        "[%d] Altering SQL executed on sandbox ✓ (rows affected: %d)",
+                        sample_idx,
+                        alter_rows_affected,
+                    )
                 except sqlite3.Error as e:
                     sandbox_err = str(e)
                     logger.warning("[%d] Altering SQL FAILED on sandbox: %s", sample_idx, e)
@@ -692,6 +797,28 @@ class Pipeline:
                             targeted_records=targeted_records,
                             alteration_type=decision.alteration_type,
                         )
+
+                    if alter_rows_affected == 0:
+                        no_op_msg = (
+                            "No rows were affected by altering SQL (0 rows changed). "
+                            "The WHERE clause likely matched no records. "
+                            "Use real keys from candidate rows or a subquery over real rows."
+                        )
+                        combined_msg = (
+                            f"{this_validation.error_message} | {no_op_msg}"
+                            if this_validation.error_message
+                            else no_op_msg
+                        )
+                        this_validation = ValidationResult(
+                            is_valid=False,
+                            error_message=combined_msg,
+                            missing_targeted=this_validation.missing_targeted,
+                            still_present_targeted=this_validation.still_present_targeted,
+                            unintended_missing=this_validation.unintended_missing,
+                            new_records=this_validation.new_records,
+                            displaced_records=this_validation.displaced_records,
+                        )
+
                     if this_validation.is_valid:
                         logger.info(
                             "[%d] ✓ Validation PASSED — %s",
@@ -739,6 +866,7 @@ class Pipeline:
             step1_attempts.append(make_attempt_log(
                 attempt=attempt, llm_call=llm_log,
                 altering_sql=alteration_response.altering_sql,
+                alter_rows_affected=alter_rows_affected,
                 sandbox_execute_success=sandbox_ok,
                 sandbox_execute_error=sandbox_err,
                 gold_sql_on_sandbox_success=gold_on_sandbox_ok,

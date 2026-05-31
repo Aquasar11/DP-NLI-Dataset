@@ -28,7 +28,7 @@ from tqdm import tqdm
 
 import config
 from config import AgentLLMConfig
-from llm_client import GeminiClient, LLMClient
+from llm_client import ClaudeVertexClient, GeminiClient, LLMClient
 from models import DatasetRecord, RunResult
 from runner import run_record
 from sample_logger import SampleLog, SampleLogger
@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     )
     global_group.add_argument(
         "--provider",
-        choices=["openai", "gemini"],
+        choices=["openai", "gemini", "claude"],
         default="openai",
         help="LLM provider (default for all agents)",
     )
@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
     # ── Per-agent LLM overrides ───────────────────────────────────────────
     def _add_agent_args(group_name: str, prefix: str, description: str) -> None:
         group = parser.add_argument_group(group_name, description)
-        group.add_argument(f"--{prefix}-provider", choices=["openai", "gemini"], default=None)
+        group.add_argument(f"--{prefix}-provider", choices=["openai", "gemini", "claude"], default=None)
         group.add_argument(f"--{prefix}-model", default=None)
         group.add_argument(f"--{prefix}-api-key", default=None)
         group.add_argument(f"--{prefix}-base-url", default=None)
@@ -230,14 +230,19 @@ def _resolve_agent_config(
     # Only inherit env_config.model when it belongs to the *same* provider;
     # otherwise fall back to the provider-appropriate default.
     explicit_model = _get("model") or global_fallback.model
+    def _default_model(p: str) -> str:
+        if p == "gemini":
+            return config.GEMINI_MODEL
+        if p == "claude":
+            return config.CLAUDE_MODEL
+        return config.OPENAI_MODEL
+
     if explicit_model:
         model = explicit_model
     elif env_config.provider == provider:
-        model = env_config.model or (
-            config.GEMINI_MODEL if provider == "gemini" else config.OPENAI_MODEL
-        )
+        model = env_config.model or _default_model(provider)
     else:
-        model = config.GEMINI_MODEL if provider == "gemini" else config.OPENAI_MODEL
+        model = _default_model(provider)
     temperature = (
         _get("temperature")
         if _get("temperature") is not None
@@ -259,7 +264,7 @@ def _resolve_agent_config(
     )
 
 
-def _build_llm(agent_config: AgentLLMConfig) -> LLMClient | GeminiClient:
+def _build_llm(agent_config: AgentLLMConfig) -> LLMClient | GeminiClient | ClaudeVertexClient:
     """Construct an LLM client from an AgentLLMConfig."""
     if agent_config.provider == "gemini":
         return GeminiClient(
@@ -267,6 +272,11 @@ def _build_llm(agent_config: AgentLLMConfig) -> LLMClient | GeminiClient:
             model=agent_config.model or None,
             temperature=agent_config.temperature,
             use_vertexai=agent_config.use_vertexai or None,
+        )
+    if agent_config.provider == "claude":
+        return ClaudeVertexClient(
+            model=agent_config.model or None,
+            temperature=agent_config.temperature,
         )
     return LLMClient(
         api_key=agent_config.api_key or None,
@@ -357,7 +367,10 @@ def main() -> None:
         sys.exit(1)
 
     with open(dataset_path, encoding="utf-8") as f:
-        raw_records = json.load(f)
+        if dataset_path.suffix == ".jsonl":
+            raw_records = [json.loads(line) for line in f if line.strip()]
+        else:
+            raw_records = json.load(f)
 
     records = [DatasetRecord(**r) for r in raw_records]
     if args.samples > 0:
