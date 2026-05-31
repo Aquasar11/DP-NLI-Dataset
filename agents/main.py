@@ -152,6 +152,26 @@ def parse_args() -> argparse.Namespace:
         default=config.ASK_QUESTION_PENALTY,
         help="Score penalty per ask_question call by the FixAgent",
     )
+    pipeline_group.add_argument(
+        "--high-level-followup-question",
+        action="store_true",
+        default=False,
+        help=(
+            "Override each sample's follow_up_question with a generic high-level "
+            "question to avoid leaking specific alteration details"
+        ),
+    )
+    pipeline_group.add_argument(
+        "--high-level-followup-text",
+        type=str,
+        default=(
+            "This query result is not what I expected. Please investigate what changed "
+            "in the database and explain why the SQL output changed."
+        ),
+        help=(
+            "Text used when --high-level-followup-question is enabled"
+        ),
+    )
 
     # ── Paths ─────────────────────────────────────────────────────────────
     path_group = parser.add_argument_group("Paths")
@@ -375,6 +395,17 @@ def main() -> None:
     records = [DatasetRecord(**r) for r in raw_records]
     if args.samples > 0:
         records = records[: args.samples]
+
+    if args.high_level_followup_question:
+        records = [
+            r.model_copy(update={"follow_up_question": args.high_level_followup_text})
+            for r in records
+        ]
+        logger.info(
+            "Overriding follow_up_question for all records with high-level text: %s",
+            args.high_level_followup_text,
+        )
+
     logger.info("Loaded %d record(s) from %s", len(records), dataset_path)
 
     # ── Build per-agent LLM clients ───────────────────────────────────────
